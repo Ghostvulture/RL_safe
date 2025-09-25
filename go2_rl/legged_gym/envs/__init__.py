@@ -13,7 +13,7 @@ from .base.legged_robot import LeggedRobot
 from legged_gym.utils.task_registry import task_registry
 
 # task_registry.register( "go2", LeggedRobot, GO2RoughCfg(), GO2RoughCfgPPO())
-task_registry.register("go2",LeggedRobot,GO2RoughCfg(),GO2RoughCfgPPO())
+task_registry.register("go2",LeggedRobot, GO2RoughCfg(),GO2RoughCfgPPO())
 task_registry.register( "h1", H1Robot, H1RoughCfg(), H1RoughCfgPPO())
 task_registry.register( "h1_2", H1_2Robot, H1_2RoughCfg(), H1_2RoughCfgPPO())
 task_registry.register( "g1", G1Robot, G1RoughCfg(), G1RoughCfgPPO())
