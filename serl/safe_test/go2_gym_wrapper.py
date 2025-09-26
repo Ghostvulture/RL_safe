@@ -2,7 +2,7 @@ import gym
 from gym.spaces import flatten_space, flatten
 import numpy as np
 from typing import Callable, Union
-from go2_rl.legged_gym.envs.base import legged_robot
+from go2_rl.legged_gym.envs.base.legged_robot import LeggedRobot
 from go2_rl.legged_gym.envs.go2.go2_config import GO2RoughCfg
 
 from isaacgym import gymapi
@@ -18,7 +18,7 @@ class Go2Wrapper(gym.Wrapper):
     """
     
     def __init__(self, 
-                 env: Go2Robot, 
+                 env: LeggedRobot, 
                  cfg: GO2RoughCfg,
                  goal_sampler: Union[np.ndarray, Callable]
                  ):

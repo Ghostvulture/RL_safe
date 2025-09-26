@@ -93,7 +93,7 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
 
     eval_env = gym.make(FLAGS.env)
     if FLAGS.env == "PandaPickCube-v0":
-        eval_env = gym.wrappers.FlattenObservation(eval_env)
+        eval_env = gym.wrappers.FlattenObservation(eval_env)#openai gym wrapper
     eval_env = RecordEpisodeStatistics(eval_env)
 
     obs, _ = env.reset()
@@ -228,7 +228,7 @@ def learner(rng, agent: SACAgent, replay_buffer, replay_iterator):
             batch = next(replay_iterator)
 
         with timer.context("train"):
-            agent, update_info = agent.update_high_utd(batch, utd_ratio=FLAGS.utd_ratio)
+            agent, update_info = agent.update_high_utd(batch, utd_ratio=1)#FLAGS.utd_ratio
             agent = jax.block_until_ready(agent)
 
             # publish the updated network
@@ -279,7 +279,7 @@ def main(_):
     # replicate agent across devices
     # need the jnp.array to avoid a bug where device_put doesn't recognize primitives
     agent: SACAgent = jax.device_put(
-        jax.tree_map(jnp.array, agent), sharding.replicate()
+        jax.tree_util.tree_map(jnp.array, agent), sharding.replicate()
     )
 
     if FLAGS.learner:

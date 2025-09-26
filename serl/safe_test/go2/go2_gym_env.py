@@ -6,6 +6,10 @@ import mujoco
 import numpy as np
 from gym import spaces
 
+#import from legged_gym base
+from go2_rl.legged_gym.envs.base.legged_robot import LeggedRobot
+from go2_rl.legged_gym.envs.go2.go2_config import GO2RoughCfg
+
 try:
     import mujoco_py
 except ImportError as e:
@@ -13,8 +17,8 @@ except ImportError as e:
 else:
     MUJOCO_PY_IMPORT_ERROR = None
 
-from franka_sim.controllers import opspace
-from franka_sim.mujoco_gym_env import GymRenderingSpec, MujocoGymEnv
+from franka_sim.franka_sim.controllers import opspace
+from franka_sim.franka_sim.mujoco_gym_env import GymRenderingSpec, MujocoGymEnv
 
 _HERE = Path(__file__).parent
 _XML_PATH = _HERE / "xmls" / "arena.xml"
@@ -23,15 +27,15 @@ _CARTESIAN_BOUNDS = np.asarray([[0.2, -0.3, 0], [0.6, 0.3, 0.5]])
 _SAMPLING_BOUNDS = np.asarray([[0.25, -0.25], [0.55, 0.25]])
 
 
-class PandaPickCubeGymEnv(MujocoGymEnv):
+class Go2GymEnv(MujocoGymEnv):
     metadata = {"render_modes": ["rgb_array", "human"]}
 
     def __init__(
         self,
-        action_scale: np.ndarray = np.asarray([0.1, 1]),
+        action_scale: float = GO2RoughCfg.control.action_scale,
         seed: int = 0,
-        control_dt: float = 0.02,
-        physics_dt: float = 0.002,
+        control_dt: float = 0.02,#TODO:控制频率
+        physics_dt: float = GO2RoughCfg.sim.dt,
         time_limit: float = 10.0,
         render_spec: GymRenderingSpec = GymRenderingSpec(),
         render_mode: Literal["rgb_array", "human"] = "rgb_array",
@@ -40,7 +44,7 @@ class PandaPickCubeGymEnv(MujocoGymEnv):
         self._action_scale = action_scale
 
         super().__init__(
-            xml_path=_XML_PATH,
+            xml_path=_XML_PATH,#TODO: change to go2 xml
             seed=seed,
             control_dt=control_dt,
             physics_dt=physics_dt,
@@ -152,7 +156,6 @@ class PandaPickCubeGymEnv(MujocoGymEnv):
         )
         if self.render_mode == "human":
             self._viewer.render(self.render_mode)
-
 
 
     def reset(
