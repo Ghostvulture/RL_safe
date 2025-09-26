@@ -25,14 +25,18 @@ from serl_launcher.agents.continuous.sac import SACAgent
 from serl_launcher.common.evaluation import evaluate
 from serl_launcher.utils.timer_utils import Timer
 
-import franka_sim
+# Import GO2 environment
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'safe_test', 'go2'))
+from go2_gym_env import Go2GymEnv
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string("env", "HalfCheetah-v4", "Name of environment.")
+flags.DEFINE_string("env", "GO2-v0", "Name of environment.")
 flags.DEFINE_string("agent", "sac", "Name of agent.")
 flags.DEFINE_string("exp_name", None, "Name of the experiment for wandb logging.")
-flags.DEFINE_integer("max_traj_length", 100, "Maximum length of trajectory.")
+flags.DEFINE_integer("max_traj_length", 500, "Maximum length of trajectory.")  # GO2 walking episodes need more steps
 flags.DEFINE_integer("seed", 42, "Random seed.")
 flags.DEFINE_bool("save_model", False, "Whether to save model.")
 flags.DEFINE_integer("batch_size", 256, "Batch size.")
@@ -41,13 +45,13 @@ flags.DEFINE_integer("critic_actor_ratio", 8, "critic to actor update ratio.")
 flags.DEFINE_integer("max_steps", 1000000, "Maximum number of training steps.")
 flags.DEFINE_integer("replay_buffer_capacity", 1000000, "Replay buffer capacity.")
 
-flags.DEFINE_integer("random_steps", 300, "Sample random actions for this many steps.")
-flags.DEFINE_integer("training_starts", 300, "Training starts after this step.")
-flags.DEFINE_integer("steps_per_update", 30, "Number of steps per update the server.")
+flags.DEFINE_integer("random_steps", 1000, "Sample random actions for this many steps.")  # More exploration for GO2
+flags.DEFINE_integer("training_starts", 1000, "Training starts after this step.")
+flags.DEFINE_integer("steps_per_update", 50, "Number of steps per update the server.")  # Less frequent updates for stability
 
-flags.DEFINE_integer("log_period", 10, "Logging period.")
-flags.DEFINE_integer("eval_period", 2000, "Evaluation period.")
-flags.DEFINE_integer("eval_n_trajs", 5, "Number of trajectories for evaluation.")
+flags.DEFINE_integer("log_period", 50, "Logging period.")  # Less frequent logging
+flags.DEFINE_integer("eval_period", 5000, "Evaluation period.")  # Less frequent evaluation
+flags.DEFINE_integer("eval_n_trajs", 3, "Number of trajectories for evaluation.")  # Fewer eval trajectories
 
 # flag to indicate if this is a leaner or a actor
 flags.DEFINE_boolean("learner", False, "Is this a learner or a trainer.")
@@ -67,6 +71,55 @@ flags.DEFINE_string("preload_rlds_path", None, "Path to preload RLDS data.")
 
 def print_green(x):
     return print("\033[92m {}\033[00m".format(x))
+
+
+def flatten_observation(obs_dict):
+    # Concatenate all observation components
+    obs_list = []
+    for key in sorted(obs_dict.keys()):  # Sort keys for consistent ordering
+        if isinstance(obs_dict[key], dict):
+            # Handle nested dict (state)
+            for subkey in sorted(obs_dict[key].keys()):
+                obs_list.append(obs_dict[key][subkey].flatten())
+        else:
+            obs_list.append(obs_dict[key].flatten())
+    return np.concatenate(obs_list)
+
+class FlattenedGO2Env(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        # Calculate flattened observation space size
+        sample_obs = env.observation_space.sample()
+        flattened_obs = flatten_observation(sample_obs)
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=flattened_obs.shape, dtype=np.float32
+        )
+        
+    def reset(self, **kwargs):
+        obs_dict, info = self.env.reset(**kwargs)
+        return flatten_observation(obs_dict), info
+        
+    def step(self, action):
+        obs_dict, reward, done, truncated, info = self.env.step(action)
+        return flatten_observation(obs_dict), reward, done, truncated, info
+
+def make_go2_env(render_mode="rgb_array"):
+    """Create GO2 gym environment"""
+    from mujoco_gym_env import GymRenderingSpec
+    
+    # Enhanced rendering configuration
+    render_spec = GymRenderingSpec(
+        width=1024,
+        height=768,
+        camera_id=0  # Use main camera
+    )
+    
+    env = Go2GymEnv(
+        render_mode=render_mode,
+        render_spec=render_spec
+    )
+    env = FlattenedGO2Env(env)
+    return env
 
 
 ##############################################################################
@@ -91,9 +144,12 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
 
     client.recv_network_callback(update_params)
 
-    eval_env = gym.make(FLAGS.env)
-    if FLAGS.env == "PandaPickCube-v0":
-        eval_env = gym.wrappers.FlattenObservation(eval_env)#openai gym wrapper
+    if FLAGS.env == "GO2-v0":
+        eval_env = make_go2_env(render_mode="rgb_array")
+    else:
+        eval_env = gym.make(FLAGS.env)
+        if FLAGS.env == "PandaPickCube-v0":
+            eval_env = gym.wrappers.FlattenObservation(eval_env)#openai gym wrapper
     eval_env = RecordEpisodeStatistics(eval_env)
 
     obs, _ = env.reset()
@@ -261,13 +317,19 @@ def main(_):
     rng = jax.random.PRNGKey(FLAGS.seed)
 
     # create env and load dataset
-    if FLAGS.render:
-        env = gym.make(FLAGS.env, render_mode="human")
+    if FLAGS.env == "GO2-v0":
+        if FLAGS.render:
+            env = make_go2_env(render_mode="human")
+        else:
+            env = make_go2_env(render_mode="rgb_array")
     else:
-        env = gym.make(FLAGS.env)
+        if FLAGS.render:
+            env = gym.make(FLAGS.env, render_mode="human")
+        else:
+            env = gym.make(FLAGS.env)
 
-    if FLAGS.env == "PandaPickCube-v0":
-        env = gym.wrappers.FlattenObservation(env)
+        if FLAGS.env == "PandaPickCube-v0":
+            env = gym.wrappers.FlattenObservation(env)
 
     rng, sampling_rng = jax.random.split(rng)
     agent: SACAgent = make_sac_agent(
