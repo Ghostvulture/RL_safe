@@ -9,4 +9,4 @@ python async_sac_state_sim.py "$@" \
     --critic_actor_ratio 4 \
     --batch_size 128 \
     --max_traj_length 500 \
-    --debug # wandb is disabled when debug
+    # --debug # wandb is disabled when debug

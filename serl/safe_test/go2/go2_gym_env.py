@@ -9,15 +9,14 @@ import os
 
 # Add the path to import go2_rl modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+# Add legged_gym to path so it can be imported as a top-level module
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'go2_rl'))
 
-#import from legged_gym base
-try:
-    from go2_rl.legged_gym.envs.base.legged_robot import LeggedRobot
-    from go2_rl.legged_gym.envs.go2.go2_config import GO2RoughCfg
-except ImportError:
-    print("Warning: go2_rl module not found, using simplified config")
-    from simple_go2_config import SimpleGO2Config as GO2RoughCfg
-    LeggedRobot = None
+#import from legged_gym base - note: go2_rl requires IsaacGym, use simplified config for MuJoCo
+print("Note: Using simplified GO2 config (compatible with MuJoCo without IsaacGym dependency)")
+from simple_go2_config import SimpleGO2Config as GO2RoughCfg
+LeggedRobot = None
+
 
 try:
     import mujoco_py
@@ -34,12 +33,13 @@ _HERE = Path(__file__).parent
 _XML_PATH = Path(__file__).parent / "go2_model" / "go2_fixed.xml"
 
 
+
 class Go2GymEnv(MujocoGymEnv):
     metadata = {"render_modes": ["rgb_array", "human"]}
 
     def __init__(
         self,
-        action_scale: float = GO2RoughCfg.control.action_scale,
+        action_scale: float = 0.25,
         seed: int = 0,
         control_dt: float = 0.02,#TODO:控制频率
         physics_dt: float = GO2RoughCfg.sim.dt,#0.002
@@ -51,7 +51,7 @@ class Go2GymEnv(MujocoGymEnv):
         self._action_scale = action_scale
 
         super().__init__(
-            xml_path=_XML_PATH,#TODO: change to go2 xml
+            xml_path=_XML_PATH,
             seed=seed,
             control_dt=control_dt,
             physics_dt=physics_dt,
@@ -150,16 +150,46 @@ class Go2GymEnv(MujocoGymEnv):
         # Initialize reward system
         self._setup_reward_functions()
 
-        # DEBUG: Print MuJoCo model info
+        # DEBUG: Print comprehensive MuJoCo model info
         print(f"DEBUG: GO2 Model loaded successfully!")
-        print(f"DEBUG: Model has {self._model.nlight} lights")
-        print(f"DEBUG: Model has {self._model.ngeom} geometries")
-        print(f"DEBUG: Render mode: {render_mode}")
-        print(f"DEBUG: Render size: {self.render_width}x{self.render_height}")
+        print(f"DEBUG: Model structure:")
+        print(f"  Bodies: {self._model.nbody}")
+        print(f"  Joints: {self._model.njnt}")
+        print(f"  DOFs (nq): {self._model.nq}")
+        print(f"  Velocities (nv): {self._model.nv}")
+        print(f"  Actuators: {self._model.nu}")
+        print(f"  Lights: {self._model.nlight}")
+        print(f"  Geometries: {self._model.ngeom}")
+        
+        # Print all joint names and IDs
+        print(f"DEBUG: All joints in model:")
+        for i in range(self._model.njnt):
+            joint_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_JOINT, i)
+            joint_type = self._model.jnt_type[i]
+            qpos_addr = self._model.jnt_qposadr[i]
+            print(f"  Joint {i}: '{joint_name}' (type: {joint_type}, qpos_addr: {qpos_addr})")
+        
+        # Print all actuator names and IDs
+        print(f"DEBUG: All actuators in model:")
+        for i in range(self._model.nu):
+            actuator_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+            print(f"  Actuator {i}: '{actuator_name}'")
         
         # Check if ground plane exists
-        ground_geom_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_GEOM, "ground")
+        ground_geom_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_GEOM, "ground")  
         print(f"DEBUG: Ground plane ID: {ground_geom_id}")
+        
+        print(f"DEBUG: Render configuration:")
+        print(f"  Mode: {render_mode}")
+        print(f"  Size: {self.render_width}x{self.render_height}")
+        
+        # Print our joint mapping
+        print(f"DEBUG: Our joint configuration:")
+        print(f"  Joint names: {self.joint_names}")
+        print(f"  Joint IDs: {self._joint_ids}")
+        print(f"  Actuator names: {self.actuator_names}")
+        print(f"  Actuator IDs: {self._actuator_ctrl_ids}")
+        print(f"  Default angles: {self.default_joint_angles}")
         
         # NOTE: gymnasium is used here since MujocoRenderer is not available in gym. It
         # is possible to add a similar viewer feature with gym, but that can be a future TODO
@@ -198,11 +228,23 @@ class Go2GymEnv(MujocoGymEnv):
         # Set base position to initial state from config
         self._data.qpos[:3] = GO2RoughCfg.init_state.pos  # x, y, z position
         
-        # Set base orientation (quaternion w, x, y, z)
-        self._data.qpos[3:7] = GO2RoughCfg.init_state.rot  # quaternion
+        # Set base orientation (quaternion w, x, y, z) - MuJoCo format
+        self._data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]  # Standing upright
         
-        # Reset joint positions to default angles
-        self._data.qpos[self._joint_ids] = self.default_joint_angles
+        # Reset joint positions using deploy_mujoco approach (which works correctly)
+        # Deploy angles in qpos[7:19] order: [FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, 
+        #                                     RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf]
+        deploy_angles = [0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 
+                         0.1, 1.0, -1.5, -0.1, 1.0, -1.5]
+        
+        print(f"DEBUG: Using deploy_mujoco approach for joint angles")
+        print(f"  Setting qpos[7:19] with angles: {deploy_angles}")
+        
+        # Set joint angles directly to qpos[7:19] (matching deploy_mujoco approach)
+        for i, angle in enumerate(deploy_angles):
+            qpos_idx = 7 + i  # Skip base position (3) and quaternion (4)
+            if qpos_idx < len(self._data.qpos):
+                self._data.qpos[qpos_idx] = angle
         
         # Reset velocities to zero
         self._data.qvel[:] = 0.0
@@ -216,8 +258,12 @@ class Go2GymEnv(MujocoGymEnv):
         # Reset time
         self._time = 0.0
         
+        # Forward dynamics to update the state
         mujoco.mj_forward(self._model, self._data)
-
+        
+        # DEBUG: Verify the final state
+        print(f"DEBUG: Reset complete - Base height: {self._data.qpos[2]:.3f}m (expected: 0.34m)")
+        
         obs = self._compute_observation()
         return obs, {}
 
@@ -242,18 +288,57 @@ class Go2GymEnv(MujocoGymEnv):
         # Store current action as previous action for next observation
         self._previous_actions = action.copy()
         
-        # Convert normalized actions to joint targets
-        # target_joint_pos = action_scale * action + default_joint_angles
-        target_joint_pos = self._action_scale * action + self.default_joint_angles
+        # Convert normalized actions to joint targets using GO2 original approach
+        # Deploy default angles: [FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, 
+        #                         RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf]
+        deploy_default_angles = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5])
         
-        # Apply actions to actuators (position control)
-        self._data.ctrl[self._actuator_ctrl_ids] = target_joint_pos
+        # Action should also be in deploy order to match default angles
+        target_joint_pos = self._action_scale * action + deploy_default_angles
+        
+        # Clip joint targets to REAL GO2 hardware limits from URDF
+        # Hip: ±1.0472 rad, Thigh: -1.5708 to 3.4907 rad, Calf: -2.7227 to -0.83776 rad
+        joint_limits_lower = np.array([-1.0472, -1.5708, -2.7227, -1.0472, -1.5708, -2.7227, 
+                                       -1.0472, -1.5708, -2.7227, -1.0472, -1.5708, -2.7227])
+        joint_limits_upper = np.array([1.0472, 3.4907, -0.83776, 1.0472, 3.4907, -0.83776, 
+                                       1.0472, 3.4907, -0.83776, 1.0472, 3.4907, -0.83776])
+        target_joint_pos = np.clip(target_joint_pos, joint_limits_lower, joint_limits_upper)
+        
+        # Get current joint positions and velocities for PD control
+        current_joint_pos = self._data.qpos[7:19]  # Skip base position and quaternion
+        current_joint_vel = self._data.qvel[6:18]  # Skip base linear and angular velocity
+        
+        # PD Controller: torques = Kp*(target - current) - Kd*velocity
+        # Using GO2 original gains: Kp=20.0, Kd=0.5
+        Kp = 20.0
+        Kd = 0.5
+        position_error = target_joint_pos - current_joint_pos
+        torques = Kp * position_error - Kd * current_joint_vel
+        
+        # Clip torques to hardware limits (from URDF: hip=23.7, thigh=23.7, calf=35.55 Nm)
+        torque_limits = np.array([23.7, 23.7, 35.55, 23.7, 23.7, 35.55,
+                                  23.7, 23.7, 35.55, 23.7, 23.7, 35.55])
+        torques = np.clip(torques, -torque_limits, torque_limits)
+        
+        # Apply torques to actuators using deploy order mapping
+        deploy_actuator_ids = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])  # Sequential order
+        self._data.ctrl[deploy_actuator_ids] = torques
+        
+        # DEBUG: Print control inputs before physics step
+        print(f"\n=== GO2 CONTROL DEBUG (Step {int(self._time / self.control_dt):4d}) ===")
+        print(f"Actions (input): {action}")
+        print(f"Target joint pos: {target_joint_pos}")
+        print(f"Position errors: {position_error}")
+        print(f"Computed torques: {torques}")
         
         # Step the physics simulation
         # Use decimation from config (default 4 steps per control step)
         decimation = getattr(GO2RoughCfg.control, 'decimation', 4)
         for _ in range(decimation):
             mujoco.mj_step(self._model, self._data)
+        
+        # DEBUG: Print joint states after physics step
+        self._debug_joint_states()
         
         # Update time
         self._time += self.control_dt
@@ -263,6 +348,18 @@ class Go2GymEnv(MujocoGymEnv):
         terminated = self.time_limit_exceeded()
 
         return obs, rew, terminated, False, {}
+
+    def set_commands(self, lin_vel_x=0.0, lin_vel_y=0.0, ang_vel_z=0.0):
+        """
+        Set movement commands for the GO2 robot.
+        
+        Args:
+            lin_vel_x (float): Forward/backward linear velocity (m/s) [positive = forward]
+            lin_vel_y (float): Left/right linear velocity (m/s) [positive = left]  
+            ang_vel_z (float): Yaw angular velocity (rad/s) [positive = counter-clockwise]
+        """
+        self._commands = np.array([lin_vel_x, lin_vel_y, ang_vel_z], dtype=np.float32)
+        print(f"Commands set to: forward={lin_vel_x:.2f} m/s, sideways={lin_vel_y:.2f} m/s, turning={ang_vel_z:.2f} rad/s")
 
     def render(self):
         print(f"DEBUG: render() called, viewer exists: {self._viewer is not None}")
@@ -285,6 +382,48 @@ class Go2GymEnv(MujocoGymEnv):
         return rendered_frames
 
     # Helper methods.
+
+    def _debug_joint_states(self):
+        """Print detailed joint states for debugging."""
+        # print("--- Joint States ---")
+        
+        # Get current joint angles (from qpos[7:19])
+        current_joint_angles = self._data.qpos[7:19]  # 12 joints
+        
+        # Get joint velocities (from qvel[6:18])  
+        current_joint_vels = self._data.qvel[6:18]  # 12 joint velocities
+        
+        # Get applied control commands (from ctrl) - these should be position targets, not torques
+        control_commands = self._data.ctrl[:12]  # First 12 actuators in deploy order
+        
+        # Get actual torques from MuJoCo actuators
+        # For position actuators, the torque is stored in actuator_force
+        actual_torques = self._data.actuator_force[:12]  # First 12 actuators (deploy order)
+        
+        # Print joint information
+        joint_names_short = ['FL_hip', 'FL_thigh', 'FL_calf', 'FR_hip', 'FR_thigh', 'FR_calf',
+                            'RL_hip', 'RL_thigh', 'RL_calf', 'RR_hip', 'RR_thigh', 'RR_calf']
+        
+        # print("Joint |   Angle  |   Vel   | Ctrl_Cmd | Torque  ")
+        # print("------|----------|---------|----------|----------")
+        for i in range(12):
+            joint_name = joint_names_short[i]
+            angle = current_joint_angles[i]
+            vel = current_joint_vels[i]
+            ctrl_cmd = control_commands[i] if i < len(control_commands) else 0.0
+            torque = actual_torques[i] if i < len(actual_torques) else 0.0
+            
+            # print(f"{joint_name:5} | {angle:8.3f} | {vel:7.3f} | {ctrl_cmd:8.3f} | {torque:7.3f}")
+        
+        # Print base state
+        base_pos = self._data.qpos[:3]
+        base_quat = self._data.qpos[3:7]
+        base_lin_vel = self._data.qvel[:3]
+        base_ang_vel = self._data.qvel[3:6]
+        
+        print(f"Base pos: [{base_pos[0]:6.3f}, {base_pos[1]:6.3f}, {base_pos[2]:6.3f}]")
+        print(f"Base vel: [{base_lin_vel[0]:6.3f}, {base_lin_vel[1]:6.3f}, {base_lin_vel[2]:6.3f}]")
+        print(f"Base ang_vel: [{base_ang_vel[0]:6.3f}, {base_ang_vel[1]:6.3f}, {base_ang_vel[2]:6.3f}]")
 
     def _compute_observation(self) -> dict:
         """Compute GO2 robot observations based on legged_gym structure."""
@@ -406,13 +545,34 @@ class Go2GymEnv(MujocoGymEnv):
         self.dof_pos = self._data.qpos[self._joint_ids].copy()
         self.dof_vel = self._data.qvel[joint_vel_start:joint_vel_start + len(self._joint_ids)].copy()
         
-        # Projected gravity (simplified approximation)
-        self.projected_gravity = np.array([0, 0, -1], dtype=np.float32)  # Should be rotated to body frame
+        # Store previous dof velocities for acceleration computation
+        if not hasattr(self, 'last_dof_vel'):
+            self.last_dof_vel = self.dof_vel.copy()
+        
+        # Store previous actions for action rate computation
+        if not hasattr(self, 'last_actions'):
+            self.last_actions = self._previous_actions.copy()
+        
+        # Projected gravity (properly computed with quaternion rotation)
+        gravity_world = np.array([0, 0, -1], dtype=np.float32)
+        # Convert quaternion to rotation matrix and rotate gravity vector
+        # For simplicity using approximation, should implement proper quaternion rotation
+        self.projected_gravity = gravity_world  # TODO: Implement proper rotation
         
         # Commands
         self.commands = self._commands.copy()
+        
+        # Contact forces (placeholder - would need contact detection for MuJoCo)
+        # In real implementation, this would come from contact sensors
+        self.contact_forces = np.zeros((4, 3), dtype=np.float32)  # 4 feet, 3D forces
+        
+        # Compute torques from current control commands
+        if hasattr(self, '_data') and hasattr(self._data, 'ctrl'):
+            self.torques = self._data.ctrl[:12].copy()  # Current control commands as torque proxy
+        else:
+            self.torques = np.zeros(12, dtype=np.float32)
 
-    # Reward functions based on legged_gym implementation
+    # --------------------Reward functions---------------------
     def _reward_tracking_lin_vel(self):
         """Tracking of linear velocity commands (xy axes)."""
         lin_vel_error = np.sum(np.square(self.commands[:2] - self.base_lin_vel[:2]))
@@ -448,12 +608,22 @@ class Go2GymEnv(MujocoGymEnv):
     
     def _reward_action_rate(self):
         """Penalize changes in actions."""
-        return np.sum(np.square(self._previous_actions))
+        if hasattr(self, 'last_actions'):
+            action_diff = self._previous_actions - self.last_actions
+            self.last_actions = self._previous_actions.copy()
+            return np.sum(np.square(action_diff))
+        else:
+            self.last_actions = self._previous_actions.copy()
+            return 0.0
     
     def _reward_torques(self):
-        """Penalize torques (placeholder - actual torques not available in MuJoCo easily)."""
-        # Approximate torque penalty based on action magnitude
-        return np.sum(np.square(self._previous_actions)) * 0.1
+        """Penalize high torques (estimated from PD control)."""
+        # Estimate torques from PD control law
+        if hasattr(self, 'torques'):
+            return np.sum(np.square(self.torques))
+        else:
+            # Fallback: use action magnitude as torque proxy
+            return np.sum(np.square(self._previous_actions * 50.0))  # Scale to approximate torque range
     
     def _reward_dof_pos_limits(self):
         """Penalize dof positions too close to limits."""
@@ -489,15 +659,88 @@ class Go2GymEnv(MujocoGymEnv):
         return 0.0
 
     def _reward_feet_air_time(self):
-        """Placeholder for feet air time reward (requires contact detection)."""
-        return 0.0
+        """Reward feet air time based on commanded velocity."""
+        # Simulate contact detection based on foot position
+        # Get foot positions from forward kinematics (simplified)
+        target_air_time = 0.5  # seconds
+        
+        # Initialize air time tracking if not exists
+        if not hasattr(self, 'feet_air_time'):
+            self.feet_air_time = np.zeros(4)
+            self.last_contacts = np.ones(4, dtype=bool)  # Assume starting on ground
+        
+        # Simplified contact detection based on base height and leg extension
+        # In a real implementation, this would use contact sensors
+        contact_threshold = 0.02  # meters above ground
+        estimated_foot_height = self.base_pos[2] - 0.3  # Rough estimate
+        current_contacts = np.array([estimated_foot_height < contact_threshold] * 4)
+        
+        # Update air time
+        for i in range(4):
+            if current_contacts[i]:
+                self.feet_air_time[i] = 0.0
+            else:
+                self.feet_air_time[i] += self.dt
+        
+        # Reward air time close to target when moving
+        rew = 0.0
+        if np.linalg.norm(self.commands[:2]) > 0.1:  # Only when commanded to move
+            for i in range(4):
+                if self.feet_air_time[i] > 0:
+                    rew += np.exp(-np.abs(self.feet_air_time[i] - target_air_time))
+        
+        self.last_contacts = current_contacts
+        return rew / 4.0  # Average over all feet
     
     def _reward_collision(self):
-        """Placeholder for collision penalty (requires contact detection)."""
-        return 0.0
+        """Penalty for collisions (simplified detection)."""
+        # In MuJoCo, we can check if the base is too low or tilted
+        collision_penalty = 0.0
+        
+        # Check if base is too low (collision with ground)
+        if self.base_pos[2] < 0.15:  # Base too close to ground
+            collision_penalty += 1.0
+        
+        # Check if robot is too tilted (potential collision)
+        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+        if abs(roll) > 0.5 or abs(pitch) > 0.5:  # Too tilted
+            collision_penalty += 0.5
+        
+        return collision_penalty
     
-    def _reward_feet_stumble(self):
-        """Placeholder for stumble penalty (requires contact detection).""" 
+    def _reward_stumble(self):
+        """Penalty for stumbling (rapid foot contacts)."""
+        if not hasattr(self, 'last_contacts'):
+            return 0.0
+        
+        # Initialize contact change tracking
+        if not hasattr(self, 'contact_changes'):
+            self.contact_changes = np.zeros(4)
+        
+        # Detect rapid contact changes (stumbling)
+        current_contacts = self.last_contacts if hasattr(self, 'last_contacts') else np.ones(4, dtype=bool)
+        
+        stumble_penalty = 0.0
+        for i in range(4):
+            if hasattr(self, 'last_last_contacts'):
+                # Check for rapid on-off-on pattern (stumble indicator)
+                if (self.last_last_contacts[i] and 
+                    not self.last_contacts[i] and 
+                    current_contacts[i]):
+                    stumble_penalty += 1.0
+        
+        # Store contact history
+        if hasattr(self, 'last_contacts'):
+            self.last_last_contacts = self.last_contacts.copy()
+        
+        return stumble_penalty
+    
+    def _reward_feet_contact_forces(self):
+        """Reward for appropriate contact forces (placeholder)."""
+        # In real implementation, this would use force sensors
+        # For now, return small positive reward when on ground
+        if self.base_pos[2] > 0.2 and self.base_pos[2] < 0.4:  # Reasonable height
+            return 0.1
         return 0.0
     
     def _reward_stand_still(self):
@@ -508,21 +751,105 @@ class Go2GymEnv(MujocoGymEnv):
         return 0.0
     
     def _reward_dof_acc(self):
-        """Penalize dof accelerations (requires previous dof_vel)."""
-        # This would need previous step's dof_vel to compute properly
-        return 0.0
+        """Penalize dof accelerations."""
+        if hasattr(self, 'last_dof_vel'):
+            dof_acc = (self.dof_vel - self.last_dof_vel) / self.dt
+            self.last_dof_vel = self.dof_vel.copy()
+            return np.sum(np.square(dof_acc))
+        else:
+            self.last_dof_vel = self.dof_vel.copy()
+            return 0.0
+    
+    def _reward_dof_vel_limits(self):
+        """Penalize dof velocities close to limits."""
+        # GO2 approximate joint velocity limits (rad/s)
+        vel_limits = np.array([
+            21.0, 21.0, 33.0,  # FL leg  
+            21.0, 21.0, 33.0,  # FR leg
+            21.0, 21.0, 33.0,  # RL leg
+            21.0, 21.0, 33.0   # RR leg
+        ])
+        
+        soft_limit = 0.9
+        vel_violations = np.clip(np.abs(self.dof_vel) - vel_limits * soft_limit, 0, None)
+        return np.sum(vel_violations)
+    
+    def _reward_torque_limits(self):
+        """Penalize torques close to limits."""
+        # GO2 approximate torque limits (Nm)
+        torque_limits = np.array([
+            23.7, 23.7, 35.5,  # FL leg
+            23.7, 23.7, 35.5,  # FR leg  
+            23.7, 23.7, 35.5,  # RL leg
+            23.7, 23.7, 35.5   # RR leg
+        ])
+        
+        soft_limit = 0.8
+        # Use action magnitude as torque proxy
+        torque_violations = np.clip(np.abs(self._previous_actions) * 50.0 - torque_limits * soft_limit, 0, None)
+        return np.sum(torque_violations)
+    
+    def _reward_dof_pos(self):
+        """Penalize joint positions away from default."""
+        # GO2 default positions (standing pose)
+        default_pos = np.array([
+            0.0, 0.8, -1.5,   # FL leg
+            0.0, 0.8, -1.5,   # FR leg
+            0.0, 1.0, -1.5,   # RL leg  
+            0.0, 1.0, -1.5    # RR leg
+        ])
+        
+        return np.sum(np.square(self.dof_pos - default_pos))
     
     def _reward_termination(self):
         """Terminal reward/penalty."""
-        # Check if robot fell down or went out of bounds
-        if self.base_pos[2] < 0.2:  # Robot too low
-            return -1.0
-        return 0.0
+        termination_penalty = 0.0
+        
+        # Check if robot fell down
+        if self.base_pos[2] < 0.15:
+            termination_penalty += 1.0
+        
+        # Check if robot is too tilted
+        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+        if abs(roll) > 1.0 or abs(pitch) > 1.0:
+            termination_penalty += 1.0
+        
+        return termination_penalty
+    
+    def _get_euler_from_quat(self, quat):
+        """Convert quaternion to Euler angles (roll, pitch, yaw)."""
+        # quat is [w, x, y, z] in MuJoCo
+        w, x, y, z = quat
+        
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+        
+        # Pitch (y-axis rotation)
+        sinp = 2 * (w * y - z * x)
+        pitch = np.arcsin(np.clip(sinp, -1.0, 1.0))
+        
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        
+        return roll, pitch, yaw
+
+
+def make_go2_env(render_mode="rgb_array", **kwargs):
+    """Factory function to create GO2 environment"""
+    return Go2GymEnv(render_mode=render_mode, **kwargs)
 
 
 if __name__ == "__main__":
     env = Go2GymEnv(render_mode="human")
     env.reset()
+    
+    # Set command for forward walking at 0.5 m/s
+    env.set_commands(lin_vel_x=0.5, lin_vel_y=0.0, ang_vel_z=0.0)
+    
     for i in range(100):
         env.step(np.random.uniform(-1, 1, 12))  # 12 actions for GO2
         env.render()

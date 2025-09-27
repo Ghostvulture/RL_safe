@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tqdm
+import wandb
 from absl import app, flags
 from flax.training import checkpoints
 
@@ -136,6 +137,26 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
         data_store,
         wait_for_server=True,
     )
+    
+    # Initialize WandB logger for actor
+    if not FLAGS.debug:
+        wandb.init(
+            project="go2_sac_training",  # 统一项目名称
+            name=f"Actor-{FLAGS.exp_name or 'default'}",  # Actor运行名称
+            group="GO2_SAC_Training",
+            tags=["SAC", "GO2", "quadruped", "actor", "environment_interaction"],
+            config={
+                "env": FLAGS.env,
+                "algorithm": "SAC",
+                "max_steps": FLAGS.max_steps,
+                "random_steps": FLAGS.random_steps,
+                "seed": FLAGS.seed,
+                "batch_size": FLAGS.batch_size,
+                "max_traj_length": FLAGS.max_traj_length,
+                "role": "actor",
+                "component": "environment_interaction",
+            }
+        )
 
     # Function to update the agent with new params
     def update_params(params):
@@ -158,6 +179,15 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
     # training loop
     timer = Timer()
     running_return = 0.0
+    episode_length = 0
+    episode_count = 0
+    total_steps = 0
+    
+    # Metrics tracking
+    episode_rewards = []
+    episode_lengths = []
+    action_magnitudes = []
+    
     for step in tqdm.tqdm(range(FLAGS.max_steps), dynamic_ncols=True):
         timer.tick("total")
 
@@ -181,6 +211,11 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
             reward = np.asarray(reward, dtype=np.float32)
 
             running_return += reward
+            episode_length += 1
+            total_steps += 1
+            
+            # Track action statistics
+            action_magnitudes.append(np.linalg.norm(actions))
 
             data_store.insert(
                 dict(
@@ -195,7 +230,24 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
 
             obs = next_obs
             if done or truncated:
+                # Log episode statistics
+                episode_rewards.append(running_return)
+                episode_lengths.append(episode_length)
+                episode_count += 1
+                
+                # WandB logging per episode
+                if not FLAGS.debug:
+                    wandb.log({
+                        "actor/episode_reward": running_return,
+                        "actor/episode_length": episode_length,
+                        "actor/episode_count": episode_count,
+                        "actor/total_steps": total_steps,
+                        "actor/avg_action_magnitude": np.mean(action_magnitudes[-episode_length:]) if action_magnitudes else 0.0,
+                        "actor/exploration_phase": step < FLAGS.random_steps,
+                    }, step=total_steps)
+                
                 running_return = 0.0
+                episode_length = 0
                 obs, _ = env.reset()
 
         if FLAGS.render:
@@ -219,6 +271,18 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
         if step % FLAGS.log_period == 0:
             stats = {"timer": timer.get_average_times()}
             client.request("send-stats", stats)
+            
+            # Additional WandB logging for training progress
+            if not FLAGS.debug and episode_rewards:
+                recent_episodes = min(10, len(episode_rewards))
+                wandb.log({
+                    "actor/avg_episode_reward_10": np.mean(episode_rewards[-recent_episodes:]),
+                    "actor/max_episode_reward": np.max(episode_rewards),
+                    "actor/min_episode_reward": np.min(episode_rewards),
+                    "actor/avg_episode_length_10": np.mean(episode_lengths[-recent_episodes:]) if episode_lengths else 0,
+                    "actor/steps_per_second": FLAGS.log_period / timer.get_average_times().get("total", 1.0),
+                    "actor/replay_buffer_size": len(data_store) if hasattr(data_store, '__len__') else 0,
+                }, step=total_steps)
 
 
 ##############################################################################
@@ -230,8 +294,8 @@ def learner(rng, agent: SACAgent, replay_buffer, replay_iterator):
     """
     # set up wandb and logging
     wandb_logger = make_wandb_logger(
-        project="serl_dev",
-        description=FLAGS.exp_name or FLAGS.env,
+        project="go2_sac_training",  # 统一项目名称
+        description=f"Learner-{FLAGS.exp_name or 'default'}",  # Learner运行名称
         debug=FLAGS.debug,
     )
 
@@ -291,8 +355,30 @@ def learner(rng, agent: SACAgent, replay_buffer, replay_iterator):
             server.publish_network(agent.state.params)
 
         if update_steps % FLAGS.log_period == 0 and wandb_logger:
-            wandb_logger.log(update_info, step=update_steps)
-            wandb_logger.log({"timer": timer.get_average_times()}, step=update_steps)
+            # Log SAC training metrics
+            log_dict = {}
+            log_dict.update(update_info)
+            
+            # Add timer information
+            log_dict.update({"timer": timer.get_average_times()})
+            
+            # Add learning progress metrics
+            log_dict["learner/update_steps"] = update_steps
+            log_dict["learner/replay_buffer_size"] = len(replay_buffer)
+            
+            # Log SAC-specific metrics if available
+            if "actor_loss" in update_info:
+                log_dict["sac/actor_loss"] = update_info["actor_loss"]
+            if "critic_loss" in update_info:
+                log_dict["sac/critic_loss"] = update_info["critic_loss"]
+            if "temp_loss" in update_info:
+                log_dict["sac/temperature_loss"] = update_info["temp_loss"]
+            if "temperature" in update_info:
+                log_dict["sac/temperature"] = update_info["temperature"]
+            if "entropy" in update_info:
+                log_dict["sac/entropy"] = update_info["entropy"]
+            
+            wandb_logger.log(log_dict, step=update_steps)
 
         if FLAGS.checkpoint_period and update_steps % FLAGS.checkpoint_period == 0:
             assert FLAGS.checkpoint_path is not None

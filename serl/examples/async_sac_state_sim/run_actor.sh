@@ -8,4 +8,4 @@ python async_sac_state_sim.py "$@" \
     --seed 0 \
     --random_steps 1000 \
     --max_traj_length 500 \
-    --debug
+    # --debug
