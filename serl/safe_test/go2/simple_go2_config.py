@@ -40,19 +40,30 @@ class SimpleGO2Config:
         soft_dof_pos_limit = 0.9
         
         class scales:
-            tracking_lin_vel = 1.0
-            tracking_ang_vel = 0.5
-            lin_vel_z = -2.0
-            ang_vel_xy = -0.05
-            orientation = 0.0
-            torques = -0.0001
-            dof_vel = 0.0
-            dof_acc = -2.5e-7
-            base_height = 0.0
-            action_rate = -0.01
-            dof_pos_limits = -10.0
+            # 正向奖励 - 鼓励前进和存活
+            alive = 2.0                    # 新增：存活奖励
+            tracking = 10.0                 # 新增：前进奖励
+            tracking_lin_vel = 2.0         # 增强：线速度跟踪
+            tracking_ang_vel = 0.5         # 保持：角速度跟踪
+            
+            # 姿态和稳定性
+            orientation = -2.0             # 增强：防止翻倒
+            base_height = -0.5             # 新增：高度保持
+            lin_vel_z = -1.0              
+            ang_vel_xy = -0.1             # 增强：防止侧翻
+            torso_ori = -0.1              # 增强：防止躯干翻转
+            # 动作平滑性
+            action_rate = -0.01           # 保持：动作变化率
+            dof_vel = -0.0              # 增强：关节速度惩罚
+            dof_acc = -2.5e-7               # 增强：关节加速度惩罚
+            torques = -0.0001             # 保持：力矩惩罚
+            
+            # 限制约束
+            dof_pos_limits = -0.0         # 减轻：关节位置限制
+            collision = -0.1              # 增强：碰撞惩罚
+            termination = -0.0           # 增强：终止惩罚
+            
+            # 暂时关闭的奖励
             stand_still = 0.0
             feet_air_time = 0.0
-            collision = -1.
             feet_stumble = 0.0
-            termination = 0.0

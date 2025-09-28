@@ -46,7 +46,7 @@ flags.DEFINE_integer("critic_actor_ratio", 8, "critic to actor update ratio.")
 flags.DEFINE_integer("max_steps", 1000000, "Maximum number of training steps.")
 flags.DEFINE_integer("replay_buffer_capacity", 1000000, "Replay buffer capacity.")
 
-flags.DEFINE_integer("random_steps", 1000, "Sample random actions for this many steps.")  # More exploration for GO2
+flags.DEFINE_integer("random_steps", 0, "Sample random actions for this many steps.")  # No random exploration for GO2 walking
 flags.DEFINE_integer("training_starts", 1000, "Training starts after this step.")
 flags.DEFINE_integer("steps_per_update", 50, "Number of steps per update the server.")  # Less frequent updates for stability
 
@@ -149,7 +149,7 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
                 "env": FLAGS.env,
                 "algorithm": "SAC",
                 "max_steps": FLAGS.max_steps,
-                "random_steps": FLAGS.random_steps,
+                # "random_steps": FLAGS.random_steps,
                 "seed": FLAGS.seed,
                 "batch_size": FLAGS.batch_size,
                 "max_traj_length": FLAGS.max_traj_length,
@@ -175,6 +175,11 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
 
     obs, _ = env.reset()
     done = False
+    
+    # Set forward walking command for GO2 training
+    if FLAGS.env == "GO2-v0":
+        env.set_commands(lin_vel_x=-1.0, lin_vel_y=0.0, ang_vel_z=0.0)  # 1 m/s forward
+        print("GO2 commands set: Forward walking at 1.0 m/s")
 
     # training loop
     timer = Timer()
@@ -192,16 +197,14 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
         timer.tick("total")
 
         with timer.context("sample_actions"):
-            if step < FLAGS.random_steps:
-                actions = env.action_space.sample()
-            else:
-                sampling_rng, key = jax.random.split(sampling_rng)
-                actions = agent.sample_actions(
-                    observations=jax.device_put(obs),
-                    seed=key,
-                    deterministic=False,
-                )
-                actions = np.asarray(jax.device_get(actions))
+            # Always use agent policy for GO2 - no random exploration phase
+            sampling_rng, key = jax.random.split(sampling_rng)
+            actions = agent.sample_actions(
+                observations=jax.device_put(obs),
+                seed=key,
+                deterministic=False,
+            )
+            actions = np.asarray(jax.device_get(actions))
 
         # Step environment
         with timer.context("step_env"):
@@ -239,16 +242,20 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
                 if not FLAGS.debug:
                     wandb.log({
                         "actor/episode_reward": running_return,
-                        "actor/episode_length": episode_length,
+                        # "actor/episode_length": episode_length,
                         "actor/episode_count": episode_count,
-                        "actor/total_steps": total_steps,
+                        # "actor/total_steps": total_steps,
                         "actor/avg_action_magnitude": np.mean(action_magnitudes[-episode_length:]) if action_magnitudes else 0.0,
-                        "actor/exploration_phase": step < FLAGS.random_steps,
+                        # "actor/exploration_phase": step < FLAGS.random_steps,
                     }, step=total_steps)
                 
                 running_return = 0.0
                 episode_length = 0
                 obs, _ = env.reset()
+                
+                # Reset forward walking command after each episode
+                if FLAGS.env == "GO2-v0":
+                    env.set_commands(lin_vel_x=-1.0, lin_vel_y=0.0, ang_vel_z=0.0)  # 1 m/s forward
 
         if FLAGS.render:
             env.render()
@@ -280,8 +287,8 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
                     "actor/max_episode_reward": np.max(episode_rewards),
                     "actor/min_episode_reward": np.min(episode_rewards),
                     "actor/avg_episode_length_10": np.mean(episode_lengths[-recent_episodes:]) if episode_lengths else 0,
-                    "actor/steps_per_second": FLAGS.log_period / timer.get_average_times().get("total", 1.0),
-                    "actor/replay_buffer_size": len(data_store) if hasattr(data_store, '__len__') else 0,
+                    # "actor/steps_per_second": FLAGS.log_period / timer.get_average_times().get("total", 1.0),
+                    # "actor/replay_buffer_size": len(data_store) if hasattr(data_store, '__len__') else 0,
                 }, step=total_steps)
 
 
@@ -371,10 +378,10 @@ def learner(rng, agent: SACAgent, replay_buffer, replay_iterator):
                 log_dict["sac/actor_loss"] = update_info["actor_loss"]
             if "critic_loss" in update_info:
                 log_dict["sac/critic_loss"] = update_info["critic_loss"]
-            if "temp_loss" in update_info:
-                log_dict["sac/temperature_loss"] = update_info["temp_loss"]
-            if "temperature" in update_info:
-                log_dict["sac/temperature"] = update_info["temperature"]
+            # if "temp_loss" in update_info:
+            #     log_dict["sac/temperature_loss"] = update_info["temp_loss"]
+            # if "temperature" in update_info:
+            #     log_dict["sac/temperature"] = update_info["temperature"]
             if "entropy" in update_info:
                 log_dict["sac/entropy"] = update_info["entropy"]
             
