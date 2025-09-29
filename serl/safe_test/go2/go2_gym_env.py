@@ -28,13 +28,47 @@ else:
 from controllers import opspace
 from mujoco_gym_env import GymRenderingSpec, MujocoGymEnv
 
-_HERE = Path(__file__).parent
 # Path: /home/xyz/Desktop/xluo/RL_safe/serl/safe_test/go2 -> /home/xyz/Desktop/xluo/RL_safe
 _XML_PATH = Path(__file__).parent / "go2_model" / "go2_fixed.xml"
 
-
+#help function
+def class_to_dict(obj) -> dict:
+    if not  hasattr(obj,"__dict__"):
+        return obj
+    result = {}
+    for key in dir(obj):
+        if key.startswith("_"):
+            continue
+        element = []
+        val = getattr(obj, key)
+        if isinstance(val, list):
+            for item in val:
+                element.append(class_to_dict(item))
+        else:
+            element = class_to_dict(val)
+        result[key] = element
+    return result
 
 class Go2GymEnv(MujocoGymEnv):
+    def _resample_commands(self):
+        # 固定前进速度为 0.5 m/s
+        lin_vel_x = 0.5
+        lin_vel_y = 0.0
+        ang_vel_z = 0.0
+        self._commands = np.array([lin_vel_x, lin_vel_y, ang_vel_z], dtype=np.float32)
+
+    def _tolerance(self, value: float, lower: float, upper: float, sigma: float = None) -> float:
+        """简单 tolerance：在 [lower, upper] 内返回 1，否则按距离做指数衰减。"""
+        if sigma is None:
+            sigma = max((upper - lower) * 0.5, 0.1)
+        if lower <= value <= upper:
+            return 1.0
+        if value < lower:
+            dist = lower - value
+        else:
+            dist = value - upper
+        return float(np.exp(- (dist / sigma)))
+
     metadata = {"render_modes": ["rgb_array", "human"]}
 
     def __init__(
@@ -42,7 +76,7 @@ class Go2GymEnv(MujocoGymEnv):
         action_scale: float = 0.25,
         seed: int = 0,
         control_dt: float = 0.02,#TODO:控制频率
-        physics_dt: float = GO2RoughCfg.sim.dt,#0.002
+        physics_dt: float = 0.002,#0.002
         time_limit: float = 10.0,
         render_spec: GymRenderingSpec = GymRenderingSpec(),
         render_mode: Literal["rgb_array", "human"] = "rgb_array",
@@ -67,9 +101,7 @@ class Go2GymEnv(MujocoGymEnv):
             "render_fps": int(np.round(1.0 / self.control_dt)),
         }
 
-        self.render_mode = render_mode
-        self.render_width = render_spec.width if render_spec.width is not None else 1024  # Increased resolution
-        self.render_height = render_spec.height if render_spec.height is not None else 768  # Increased resolution
+        self.render_height = render_spec.height if render_spec.height is not None else 768
 
         self.camera_id = (0, 1)
         self.image_obs = image_obs
@@ -252,8 +284,8 @@ class Go2GymEnv(MujocoGymEnv):
         # Initialize previous actions to zero
         self._previous_actions = np.zeros(self.num_actions, dtype=np.float32)
         
-        # Initialize movement commands for forward walking training
-        self._commands = np.array([1.0, 0.0, 0.0], dtype=np.float32)  # [1 m/s forward, 0 sideways, 0 turning]
+        # 自动采样初始 command（每次 reset 时）
+        self._resample_commands()
         
         # Reset time
         self._time = 0.0
@@ -305,15 +337,14 @@ class Go2GymEnv(MujocoGymEnv):
         target_joint_pos = np.clip(target_joint_pos, joint_limits_lower, joint_limits_upper)
         
         # Get current joint positions and velocities for PD control
-        current_joint_pos = self._data.qpos[7:19]  # Skip base position and quaternion
-        current_joint_vel = self._data.qvel[6:18]  # Skip base linear and angular velocity
+        current_joint_pos = self._data.qpos[7:]  # Skip base position and quaternion
+        current_joint_vel = self._data.qvel[6:]  # Skip base linear and angular velocity
         
         # PD Controller: torques = Kp*(target - current) - Kd*velocity
-        # 增加PD增益来改善姿态控制
-        Kp = 30.0  # 增加刚度
-        Kd = 1.0   # 增加阻尼
+        Kps = [30.0] *12 
+        Kds = [3.0] *12 
         position_error = target_joint_pos - current_joint_pos
-        torques = Kp * position_error - Kd * current_joint_vel
+        torques = (position_error) * Kps + (np.zeros_like(Kds) - current_joint_vel) * Kds
         
         # Clip torques to hardware limits (from URDF: hip=23.7, thigh=23.7, calf=35.55 Nm)
         torque_limits = np.array([23.7, 23.7, 35.55, 23.7, 23.7, 35.55,
@@ -322,14 +353,10 @@ class Go2GymEnv(MujocoGymEnv):
         
         # Apply torques to actuators using deploy order mapping
         deploy_actuator_ids = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])  # Sequential order
-        self._data.ctrl[deploy_actuator_ids] = torques
+        self._data.ctrl[:] = torques
         
         # # DEBUG: Print control inputs before physics step
         print(f"\n=== GO2 CONTROL DEBUG (Step {int(self._time / self.control_dt):4d}) ===")
-        # print(f"Actions (input): {action}")
-        # print(f"Target joint pos: {target_joint_pos}")
-        # print(f"Position errors: {position_error}")
-        # print(f"Computed torques: {torques}")
         
         # Step the physics simulation
         # Use decimation from config (default 4 steps per control step)
@@ -343,6 +370,9 @@ class Go2GymEnv(MujocoGymEnv):
         # Update time
         self._time += self.control_dt
 
+        # 每隔100步采样一次新的command
+        if int(self._time / self.control_dt) % 100 == 0:
+            self._resample_commands()
         obs = self._compute_observation()
         rew = self._compute_reward()
         terminated = self.time_limit_exceeded()
@@ -475,18 +505,9 @@ class Go2GymEnv(MujocoGymEnv):
 
     def _setup_reward_functions(self):
         """Setup reward functions based on GO2 config scales."""
-        try:
-            from go2_rl.legged_gym.utils.helpers import class_to_dict
-            # Get reward scales from config
-            self.reward_scales = class_to_dict(GO2RoughCfg.rewards.scales)
-        except ImportError:
-            # Fallback: manually extract scales from config
-            self.reward_scales = {}
-            scales_obj = GO2RoughCfg.rewards.scales
-            for attr_name in dir(scales_obj):
-                if not attr_name.startswith('_') and not callable(getattr(scales_obj, attr_name)):
-                    self.reward_scales[attr_name] = getattr(scales_obj, attr_name)
-        
+ 
+        # Get reward scales from config
+        self.reward_scales = class_to_dict(GO2RoughCfg.rewards.scales)
         self.dt = self.control_dt  # Use control timestep
         
         # Remove zero scales and multiply by dt
@@ -517,7 +538,7 @@ class Go2GymEnv(MujocoGymEnv):
         # Update state variables needed for reward computation
         self._update_reward_state()
         
-        # Compute each reward component
+        # Compute each reward component， 直接简单加和
         for i, reward_func in enumerate(self.reward_functions):
             name = self.reward_names[i]
             try:
@@ -588,22 +609,28 @@ class Go2GymEnv(MujocoGymEnv):
         return alive_reward
     
     def _reward_tracking(self):
-        """Reward for making forward progress."""
-        # Forward velocity reward
-        forward_vel = self.base_lin_vel[0]  # x-axis velocity
-        
-        # 强化前进奖励，惩罚后退
-        if forward_vel > 0.0:
-            forward_reward = min(forward_vel * 2.0, 4.0)  # 放大前进奖励
-        else:
-            forward_reward = forward_vel * 1.0  # 轻微惩罚后退
-        
-        # Bonus for maintaining target velocity
-        target_vel = 1.0  # m/s
-        vel_error = abs(forward_vel - target_vel)
-        tracking_bonus = np.exp(-vel_error)
-        
-        return forward_reward + tracking_bonus
+        """改进的前进速度奖励：使用 pitch 修正、tolerance、yaw 惩罚、足部接触乘子并放大。"""
+        # 当前前向速度（世界/机身 x 轴）
+        lin_vel = float(self.base_lin_vel[0])
+        # RPY
+        _, pitch, _ = self._get_euler_from_quat(self.base_quat)
+
+        # 鼓励身体水平时前进
+        forward_aligned = lin_vel * np.cos(pitch)
+
+        # 使用 tolerance：目标速度范围 [0.5, 1.0] 时给最高奖励
+        target_low = 0.5
+        tol_reward = self._tolerance(forward_aligned, target_low, target_low*2)
+
+        # 偏航（yaw 角速度）惩罚
+        yaw_rate = float(self.base_ang_vel[2])
+        yaw_penalty = 0.1 * abs(yaw_rate)
+
+        reward = tol_reward - yaw_penalty
+        reward = max(reward, 0.0)  # 不让 reward 变为负数（可选策略）
+        reward *= 10.0
+
+        return reward
         
     def _reward_tracking_lin_vel(self):
         """Tracking of linear velocity commands (xy axes)."""
@@ -875,13 +902,45 @@ def make_go2_env(render_mode="rgb_array", **kwargs):
 
 
 if __name__ == "__main__":
+    # Demo / smoke-test for the GO2 MuJoCo environment.
+    # Improvements over the original:
+    # - Use try/finally to ensure env.close() is always called
+    # - Capture and print step return values (obs, reward, done)
+    # - Use a gentle sinusoidal action pattern instead of full-random actions
+    # - Render intermittently to reduce overhead
+    import time
+
     env = Go2GymEnv(render_mode="human")
-    env.reset()
-    
+    obs, _ = env.reset()
+
     # Set command for forward walking at 0.5 m/s
     env.set_commands(lin_vel_x=0.5, lin_vel_y=0.0, ang_vel_z=0.0)
-    
-    for i in range(100):
-        env.step(np.random.uniform(-1, 1, 12))  # 12 actions for GO2
-        env.render()
-    env.close()
+
+    steps = 200
+    render_every = 2
+
+    try:
+        for i in range(steps):
+            # Gentle sinusoidal actions to explore movement without destructive randomness
+            t = i * env.control_dt
+            phases = np.arange(env.num_actions)
+            action = 0.2 * np.sin(2.0 * np.pi * 0.5 * t + 0.5 * phases)
+
+            obs, rew, terminated, truncated, info = env.step(action)
+
+            # Print concise debug info
+            cmd = obs["state"]["go2/cmd"] if "state" in obs and "go2/cmd" in obs["state"] else env._commands
+            print(f"Step {i:04d} reward={rew:.4f} cmd=[{cmd[0]:.2f},{cmd[1]:.2f},{cmd[2]:.2f}] terminated={terminated}")
+
+            # Render less frequently to keep demo responsive
+            if (i % render_every) == 0:
+                frames = env.render()
+
+            if terminated or truncated:
+                print(f"Episode finished at step {i}")
+                break
+
+            # Sleep to roughly match real-time control rate (optional)
+            time.sleep(max(0.0, env.control_dt * 0.5))
+    finally:
+        env.close()
