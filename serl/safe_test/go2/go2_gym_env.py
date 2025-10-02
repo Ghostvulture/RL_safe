@@ -328,7 +328,8 @@ class Go2GymEnv(MujocoGymEnv):
         # Convert normalized actions to joint targets using GO2 original approach
         # Deploy default angles: [FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, 
         #                         RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf]
-        deploy_default_angles = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 0.1, 1.0, -1.5, -0.1, 1.0, -1.5])
+        deploy_default_angles = np.array([0.1, 0.8, -1.5, -0.1, 0.8, -1.5, 
+                                          0.1, 1.0, -1.5, -0.1, 1.0, -1.5])
         
         # Action should also be in deploy order to match default angles
         target_joint_pos = self._action_scale * action + deploy_default_angles
@@ -346,7 +347,7 @@ class Go2GymEnv(MujocoGymEnv):
         current_joint_vel = self._data.qvel[6:]  # Skip base linear and angular velocity
         
         # PD Controller: torques = Kp*(target - current) - Kd*velocity
-        Kps = [30.0] *12 
+        Kps = [40.0] *12 
         Kds = [2.0] *12 
         position_error = target_joint_pos - current_joint_pos
         torques = (position_error) * Kps + (np.zeros_like(Kds) - current_joint_vel) * Kds
@@ -413,13 +414,13 @@ class Go2GymEnv(MujocoGymEnv):
         roll, pitch, yaw = self._get_euler_from_quat(base_quat)
         
         # 角度限制 - 给orientation奖励留出发挥空间
-        if abs(roll) > 0.5 or abs(pitch) > 0.5:  # 约30度
+        if abs(roll) > 0.4 or abs(pitch) > 0.4:  # 约30度
             print(f"！！！！！！！！！！！！！！！！！早期终止: 姿态过倾斜 (roll={roll:.2f}, pitch={pitch:.2f})")
             return True
         
         # 3. 速度检查 - 如果机器人在剧烈旋转
         base_ang_vel = self._data.qvel[3:6]
-        if np.linalg.norm(base_ang_vel) > 5.0:  # 角速度过大
+        if np.linalg.norm(base_ang_vel) > 10.0:  # 角速度过大
             print(f"！！！！！！！！！！！！！！！！！早期终止: 角速度过大 ({np.linalg.norm(base_ang_vel):.2f})")
             return True
         
@@ -598,10 +599,238 @@ class Go2GymEnv(MujocoGymEnv):
 
     def _compute_reward(self) -> float:
         """Compute rewards using GO2 reward functions."""
-        total_reward = 0.0
-        
         # Update state variables needed for reward computation
         self._update_reward_state()
+        
+        # Check if using sparse reward mode
+        use_sparse = getattr(GO2RoughCfg.env, 'use_sparse_reward', False)
+        
+        if use_sparse:
+            # Use sparse reward similar to SAC fine-tuning code
+            return self._compute_sparse_reward()
+        else:
+            # Use original complex reward system
+            return self._compute_complex_reward()
+    
+    def _compute_sparse_reward(self) -> float:
+        """
+        Improved sparse reward function with leg movement incentives.
+        Based on forward velocity with contact, stability, and hip movement rewards.
+        """
+        # Get current state
+        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+        base_ang_vel = self.base_ang_vel
+        lin_vel = self.base_lin_vel[0]  # Forward velocity
+        target_vel = 0.5  # Target forward velocity (m/s)
+        
+        # 1. 更严格的速度奖励 - 只有真正前进才给奖励
+        adjusted_vel = lin_vel * np.cos(pitch)  # Adjust for pitch
+        
+        # 使用更严格的速度阈值，低速度时给予更严厉的惩罚
+        if adjusted_vel < 0.1:  # 速度太低，基本没有前进
+            velocity_reward = -1.0  # 直接给负奖励
+        elif adjusted_vel < target_vel * 0.5:  # 速度不足
+            velocity_reward = self._tolerance_reward(
+                x=adjusted_vel,
+                bounds=(0.1, target_vel * 0.5),
+                margin=0.2,
+                value_at_margin=0.0,
+                sigmoid='linear'
+            ) - 0.5  # 给予负的基础奖励
+        else:  # 速度较好
+            velocity_reward = self._tolerance_reward(
+                x=adjusted_vel,
+                bounds=(target_vel * 0.5, target_vel * 1.5),
+                margin=target_vel,
+                value_at_margin=0.2,
+                sigmoid='gaussian'
+            )
+        
+        # 2. 增强的倾倒惩罚
+        tilt_penalty = 0.0
+        if abs(pitch) > 0.3:  # pitch过大，可能在向前倾倒
+            tilt_penalty += 2.0 * (abs(pitch) - 0.3)
+        if abs(roll) > 0.3:  # roll过大
+            tilt_penalty += 1.0 * (abs(roll) - 0.3)
+        
+        # 3. Penalty for excessive yaw rate
+        yaw_rate_penalty = 0.2 * np.abs(base_ang_vel[2])
+        
+        # 4. Hip movement reward - 但只有在有基本前进时才给予
+        hip_movement_reward = self._compute_hip_movement_reward()
+        if adjusted_vel < 0.1:  # 如果没有前进，hip运动奖励减半
+            hip_movement_reward *= 0.5
+        
+        # 5. 修改后的稳定性奖励 - 与速度相关
+        stability_reward = self._compute_stability_reward()
+        # 只有在有合理前进速度时，稳定性才重要
+        if adjusted_vel < 0.2:
+            stability_reward *= 0.3  # 大幅降低稳定性奖励权重
+        
+        # 6. Contact factor - 更严格的接触检查
+        contact_factor = self._compute_contact_factor()
+        
+        # 7. Action smoothness reward
+        action_smoothness_reward = self._compute_action_smoothness_reward()
+        
+        # 重新设计奖励组合 - 速度是主要因素
+        base_reward = velocity_reward - yaw_rate_penalty - tilt_penalty
+        
+        # 只有在基础奖励为正时，才考虑bonus奖励
+        if base_reward > 0:
+            bonus_rewards = (hip_movement_reward * 0.3 + 
+                            stability_reward * 0.5 + 
+                            action_smoothness_reward * 0.2)
+            total_reward = (base_reward + bonus_rewards) * contact_factor * 10.0
+        else:
+            # 如果基础奖励是负的，bonus无法救赎
+            total_reward = base_reward * contact_factor * 10.0
+        
+        # Debug output
+        if int(self._time / self.control_dt) % 20 == 0:
+            print(f"SPARSE REWARD: vel={lin_vel:.3f}, adj_vel={adjusted_vel:.3f}, vel_rew={velocity_reward:.3f}")
+            print(f"  hip_mov={hip_movement_reward:.3f}, stability={stability_reward:.3f}, contact={contact_factor:.1f}")
+            print(f"  tilt_pen={tilt_penalty:.3f}, yaw_pen={yaw_rate_penalty:.3f}, smooth={action_smoothness_reward:.3f}")
+            print(f"  base_rew={base_reward:.3f}, total={total_reward:.3f}")
+        
+        return float(total_reward)
+    
+    def _compute_hip_movement_reward(self) -> float:
+        """
+        鼓励hip关节运动的奖励函数。
+        通过奖励hip关节的速度变化来鼓励步行行为。
+        """
+        # GO2的hip关节索引：FL_hip=0, FR_hip=3, RL_hip=6, RR_hip=9
+        hip_indices = [0, 3, 6, 9]
+        hip_velocities = self.dof_vel[hip_indices]
+        
+        # 计算hip关节速度的均值和变化
+        hip_speed = np.mean(np.abs(hip_velocities))
+        
+        # 鼓励适度的hip运动（不要太快也不要太慢）
+        hip_speed_reward = self._tolerance_reward(
+            x=hip_speed,
+            bounds=(0.5, 3.0),  # 期望的hip速度范围
+            margin=2.0,
+            value_at_margin=0.0,
+            sigmoid='gaussian'
+        )
+        
+        # 奖励hip关节之间的协调运动（对角线步态）
+        # FL和RR应该同相，FR和RL应该同相，但两组应该反相
+        fl_hip_vel, fr_hip_vel, rl_hip_vel, rr_hip_vel = hip_velocities
+        
+        # 对角线协调性：FL与RR，FR与RL
+        diagonal_sync = (np.sign(fl_hip_vel) * np.sign(rr_hip_vel) + 
+                        np.sign(fr_hip_vel) * np.sign(rl_hip_vel)) / 2.0
+        
+        # 左右交替性：FL与FR应该反向，RL与RR应该反向
+        alternating_sync = -(np.sign(fl_hip_vel) * np.sign(fr_hip_vel) + 
+                           np.sign(rl_hip_vel) * np.sign(rr_hip_vel)) / 2.0
+        
+        coordination_reward = (diagonal_sync + alternating_sync) / 2.0
+        coordination_reward = max(0.0, coordination_reward)  # 只奖励正确的协调
+        
+        return hip_speed_reward * 0.7 + coordination_reward * 0.3
+    
+    def _compute_stability_reward(self) -> float:
+        """
+        稳定性奖励：防止机器人倾倒。
+        """
+        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+        
+        # 高度稳定性
+        height_stability = self._tolerance_reward(
+            x=self.base_pos[2],
+            bounds=(0.25, 0.45),  # 期望高度范围
+            margin=0.15,
+            value_at_margin=0.0,
+            sigmoid='gaussian'
+        )
+        
+        # 姿态稳定性
+        roll_stability = self._tolerance_reward(
+            x=abs(roll),
+            bounds=(0.0, 0.2),  # 允许小幅倾斜
+            margin=0.3,
+            value_at_margin=0.0,
+            sigmoid='gaussian'
+        )
+        
+        pitch_stability = self._tolerance_reward(
+            x=abs(pitch),
+            bounds=(0.0, 0.15),  # pitch控制更严格
+            margin=0.25,
+            value_at_margin=0.0,
+            sigmoid='gaussian'
+        )
+        
+        # 角速度稳定性
+        angular_stability = self._tolerance_reward(
+            x=np.linalg.norm(self.base_ang_vel[:2]),  # roll和pitch角速度
+            bounds=(0.0, 1.0),
+            margin=2.0,
+            value_at_margin=0.0,
+            sigmoid='gaussian'
+        )
+        
+        return (height_stability * 0.3 + roll_stability * 0.25 + 
+                pitch_stability * 0.25 + angular_stability * 0.2)
+    
+    def _compute_contact_factor(self) -> float:
+        """
+        更严格的接触因子：基于机器人状态估计是否保持地面接触。
+        """
+        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+        
+        # 更严格的稳定性检查
+        height_ok = self.base_pos[2] > 0.2 and self.base_pos[2] < 0.5
+        orientation_ok = abs(roll) < 0.4 and abs(pitch) < 0.4
+        angular_vel_ok = np.linalg.norm(self.base_ang_vel) < 2.0
+        
+        # 检查是否在"倾倒状态"
+        is_falling = (abs(pitch) > 0.35 or abs(roll) > 0.35 or 
+                     self.base_pos[2] < 0.18 or
+                     np.linalg.norm(self.base_ang_vel[:2]) > 1.5)  # roll/pitch角速度过大
+        
+        if is_falling:
+            return 0.05  # 倾倒时给予极小的因子
+        elif height_ok and orientation_ok and angular_vel_ok:
+            # 根据稳定程度给予不同的接触因子
+            height_factor = self._tolerance_reward(x=self.base_pos[2], bounds=(0.28, 0.42), margin=0.08)
+            roll_factor = self._tolerance_reward(x=abs(roll), bounds=(0.0, 0.15), margin=0.15)
+            pitch_factor = self._tolerance_reward(x=abs(pitch), bounds=(0.0, 0.1), margin=0.15)
+            
+            stability_score = (height_factor + roll_factor + pitch_factor) / 3.0
+            return 0.6 + 0.4 * stability_score  # 0.6 到 1.0 之间
+        else:
+            return 0.2  # 不稳定时给予较小的因子
+    
+    def _compute_action_smoothness_reward(self) -> float:
+        """
+        动作平滑性奖励：鼓励平滑的关节运动。
+        """
+        if not hasattr(self, 'last_actions'):
+            return 0.0
+        
+        # 计算动作变化率
+        action_diff = self._previous_actions - self.last_actions
+        action_rate = np.linalg.norm(action_diff) / self.dt
+        
+        # 鼓励适度的动作变化（不要太剧烈）
+        smoothness_reward = self._tolerance_reward(
+            x=action_rate,
+            bounds=(0.0, 5.0),  # 允许适度的动作变化
+            margin=10.0,
+            value_at_margin=0.0,
+            sigmoid='gaussian'
+        )
+        
+        return smoothness_reward
+    
+    def _compute_complex_reward(self) -> float:
+        """Original complex reward system with multiple components."""
+        total_reward = 0.0
         
         # Compute each reward component， 直接简单加和
         for i, reward_func in enumerate(self.reward_functions):
@@ -654,61 +883,55 @@ class Go2GymEnv(MujocoGymEnv):
             self.torques = self._data.ctrl[:12].copy()  # Current control commands as torque proxy
         else:
             self.torques = np.zeros(12, dtype=np.float32)
+        
+        # Tracking sigma for reward computation
+        self.tracking_sigma = getattr(GO2RoughCfg.rewards, 'tracking_sigma', 0.25)
+        
+        # Time step
+        self.dt = self.control_dt
 
     # --------------------Reward functions---------------------
-    def _reward_alive(self):
-        """Reward for staying alive and upright."""
-        # Base reward for being alive
-        alive_reward = 1.0
+    # def _reward_alive(self):
+    #     """Reward for staying alive and upright."""
+    #     # Base reward for being alive
+    #     alive_reward = 1.0
         
-        # Bonus for maintaining good posture
-        if self.base_pos[2] > 0.25:  # Above minimum height
-            alive_reward += 0.5
+    #     # Bonus for maintaining good posture
+    #     if self.base_pos[2] > 0.25:  # Above minimum height
+    #         alive_reward += 0.5
             
-        # Bonus for good orientation
-        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
-        if abs(roll) < 0.3 and abs(pitch) < 0.3:  # Not too tilted
-            alive_reward += 0.5
+    #     # Bonus for good orientation
+    #     roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+    #     if abs(roll) < 0.3 and abs(pitch) < 0.3:  # Not too tilted
+    #         alive_reward += 0.5
             
-        return alive_reward
+    #     return alive_reward
     
-    def _reward_tracking(self):
-        """改进的前进速度奖励：使用 pitch 修正、tolerance、yaw 惩罚、足部接触乘子并放大。"""
-        # 当前前向速度（世界/机身 x 轴）
-        lin_vel = float(self.base_lin_vel[0])
-        # RPY
-        _, pitch, _ = self._get_euler_from_quat(self.base_quat)
+    # def _reward_tracking(self):
+    #     """改进的前进速度奖励：使用 pitch 修正、tolerance、yaw 惩罚、足部接触乘子并放大。"""
+    #     # 当前前向速度（世界/机身 x 轴）
+    #     lin_vel = float(self.base_lin_vel[0])
+    #     # RPY
+    #     _, pitch, _ = self._get_euler_from_quat(self.base_quat)
 
-        # 鼓励身体水平时前进
-        forward_aligned = lin_vel * np.cos(pitch)
+    #     # 鼓励身体水平时前进
+    #     forward_aligned = lin_vel * np.cos(pitch)
 
-        # # 使用 tolerance：目标速度范围 [0.5, 1.0] 时给最高奖励
-        # target_low = 0.5
-        # tol_reward = self._tolerance(forward_aligned, target_low, target_low*2)
+    #     # # 使用 tolerance：目标速度范围 [0.5, 1.0] 时给最高奖励
+    #     # target_low = 0.5
+    #     # tol_reward = self._tolerance(forward_aligned, target_low, target_low*2)
 
-        # # 偏航（yaw 角速度）惩罚
-        # yaw_rate = float(self.base_ang_vel[2])
-        # yaw_penalty = 0.1 * abs(yaw_rate)
+    #     # # 偏航（yaw 角速度）惩罚
+    #     # yaw_rate = float(self.base_ang_vel[2])
+    #     # yaw_penalty = 0.1 * abs(yaw_rate)
 
-        # reward = tol_reward - yaw_penalty
-        reward += forward_aligned
-        reward = max(reward, 0.0)  # 不让 reward 变为负数（可选策略）
-        reward *= 10.0
+    #     # reward = tol_reward - yaw_penalty
+    #     reward += forward_aligned
+    #     reward = max(reward, 0.0)  # 不让 reward 变为负数（可选策略）
+    #     reward *= 10.0
 
-        return reward
+    #     return reward
         
-    def _reward_tracking_lin_vel(self):
-        """Tracking of linear velocity commands (xy axes)."""
-        lin_vel_error = np.sum(np.square(self.commands[:2] - self.base_lin_vel[:2]))
-        tracking_sigma = getattr(GO2RoughCfg.rewards, 'tracking_sigma', 0.25)
-        return np.exp(-lin_vel_error / tracking_sigma)*5
-    
-    def _reward_tracking_ang_vel(self):
-        """Tracking of angular velocity commands (yaw).""" 
-        ang_vel_error = np.square(self.commands[2] - self.base_ang_vel[2])
-        tracking_sigma = getattr(GO2RoughCfg.rewards, 'tracking_sigma', 0.25)
-        return np.exp(-ang_vel_error / tracking_sigma)*5
-    
     def _reward_lin_vel_z(self):
         """Penalize z axis base linear velocity."""
         return np.square(self.base_lin_vel[2])
@@ -719,22 +942,70 @@ class Go2GymEnv(MujocoGymEnv):
     
     def _reward_orientation(self):
         """Penalize non flat base orientation."""
-        # Use the first two components (x, y) of projected gravity
-        # When robot is upright, projected_gravity should be [0, 0, -1]
-        # When tilted, x and y components will be non-zero
-        orientation_penalty = np.sum(np.square(self.projected_gravity[:2]))
-        
-        # Debug: Print orientation info occasionally
-        if hasattr(self, '_time') and int(self._time / self.control_dt) % 50 == 0:
-            roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
-            print(f"DEBUG orientation: projected_gravity={self.projected_gravity}, penalty={orientation_penalty:.6f}, roll={roll:.3f}, pitch={pitch:.3f}")
-        
-        return orientation_penalty
-    
+        return np.sum(np.square(self.projected_gravity[:2]))
+
     def _reward_base_height(self):
         """Penalize base height away from target."""
-        target_height = 0.34  # meters
-        return np.square(self.base_pos[2] - target_height)
+        base_height_target = getattr(GO2RoughCfg.rewards, 'base_height_target', 0.34)
+        return np.square(self.base_pos[2] - base_height_target)
+    
+    def _reward_torques(self):
+        """Penalize torques."""
+        return np.sum(np.square(self.torques))
+
+    def _reward_dof_vel(self):
+        """Penalize dof velocities."""
+        return np.sum(np.square(self.dof_vel))
+    
+    def _reward_dof_acc(self):
+        """Penalize dof accelerations."""
+        if hasattr(self, 'last_dof_vel'):
+            dof_acc = (self.last_dof_vel - self.dof_vel) / self.dt
+            self.last_dof_vel = self.dof_vel.copy()
+            return np.sum(np.square(dof_acc))
+        else:
+            self.last_dof_vel = self.dof_vel.copy()
+            return 0.0
+    
+    def _reward_action_rate(self):
+        """Penalize changes in actions."""
+        if hasattr(self, 'last_actions'):
+            action_diff = self._previous_actions - self.last_actions
+            self.last_actions = self._previous_actions.copy()
+            return np.sum(np.square(action_diff))
+        else:
+            self.last_actions = self._previous_actions.copy()
+            return 0.0
+    
+    def _reward_collision(self):
+        """Penalize collisions on selected bodies."""
+        # Simplified collision detection - penalize low height or extreme tilting
+        collision_penalty = 0.0
+        if self.base_pos[2] < 0.15:  # Too low
+            collision_penalty += 1.0
+        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+        if abs(roll) > 0.6 or abs(pitch) > 0.6:  # Too tilted
+            collision_penalty += 1.0
+        return collision_penalty
+    
+    def _reward_termination(self):
+        """Terminal reward / penalty."""
+        # Check for early termination conditions
+        if hasattr(self, '_was_early_terminated') and self._was_early_terminated:
+            return 1.0
+        return 0.0
+
+    def _reward_tracking_lin_vel(self):
+        """Tracking of linear velocity commands (xy axes)."""
+        lin_vel_error = np.sum(np.square(self.commands[:2] - self.base_lin_vel[:2]))
+        tracking_sigma = getattr(GO2RoughCfg.rewards, 'tracking_sigma', 0.25)
+        return np.exp(-lin_vel_error / tracking_sigma)
+    
+    def _reward_tracking_ang_vel(self):
+        """Tracking of angular velocity commands (yaw).""" 
+        ang_vel_error = np.square(self.commands[2] - self.base_ang_vel[2])
+        tracking_sigma = getattr(GO2RoughCfg.rewards, 'tracking_sigma', 0.25)
+        return np.exp(-ang_vel_error / tracking_sigma)
     
     def _reward_dof_vel(self):
         """Penalize dof velocities."""
@@ -786,116 +1057,105 @@ class Go2GymEnv(MujocoGymEnv):
         out_of_limits += np.clip(self.dof_pos - soft_upper, 0, None)  # upper limit violations
         return np.sum(out_of_limits)
 
-    # Additional reward functions that might be in the config but not implemented above
-    def _reward_tracking_sigma(self):
-        """Dummy function - tracking_sigma is a parameter, not a reward."""
-        return 0.0
+    # Additional helper functions for reward computation
 
     def _reward_feet_air_time(self):
-        """Reward feet air time based on commanded velocity."""
-        # Simulate contact detection based on foot position
-        # Get foot positions from forward kinematics (simplified)
-        target_air_time = 0.5  # seconds
-        
-        # Initialize air time tracking if not exists
-        if not hasattr(self, 'feet_air_time'):
-            self.feet_air_time = np.zeros(4)
-            self.last_contacts = np.ones(4, dtype=bool)  # Assume starting on ground
-        
-        # Simplified contact detection based on base height and leg extension
-        # In a real implementation, this would use contact sensors
+        """Reward long steps."""
+        # Need to filter the contacts because the contact reporting of PhysX is unreliable on meshes
         contact_threshold = 0.02  # meters above ground
         estimated_foot_height = self.base_pos[2] - 0.3  # Rough estimate
-        current_contacts = np.array([estimated_foot_height < contact_threshold] * 4)
+        contact = np.array([estimated_foot_height < contact_threshold] * 4, dtype=bool)
         
-        # Update air time
-        for i in range(4):
-            if current_contacts[i]:
-                self.feet_air_time[i] = 0.0
-            else:
-                self.feet_air_time[i] += self.dt
+        # Initialize tracking variables if not exists
+        if not hasattr(self, 'feet_air_time'):
+            self.feet_air_time = np.zeros(4, dtype=np.float32)
+            self.last_contacts = np.ones(4, dtype=bool)
         
-        # Reward air time close to target when moving
-        rew = 0.0
-        if np.linalg.norm(self.commands[:2]) > 0.1:  # Only when commanded to move
-            for i in range(4):
-                if self.feet_air_time[i] > 0:
-                    rew += np.exp(-np.abs(self.feet_air_time[i] - target_air_time))
-        
-        self.last_contacts = current_contacts
-        return rew / 4.0  # Average over all feet
-    
-    def _reward_collision(self):
-        """Penalty for collisions (simplified detection)."""
-        # In MuJoCo, we can check if the base is too low or tilted
-        collision_penalty = 0.0
-        
-        # Check if base is too low (collision with ground)
-        if self.base_pos[2] < 0.10:  # 降低阈值，给学习更多空间
-            collision_penalty += 1.0
-        
-        # Check if robot is too tilted (potential collision)
-        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
-        if abs(roll) > 0.5 or abs(pitch) > 0.5:  # Too tilted
-            collision_penalty += 0.5
-        
-        return collision_penalty
+        contact_filt = np.logical_or(contact, self.last_contacts)
+        self.last_contacts = contact.copy()
+        first_contact = (self.feet_air_time > 0.) * contact_filt
+        self.feet_air_time += self.dt
+        rew_airTime = np.sum((self.feet_air_time - 0.5) * first_contact)  # reward only on first contact with the ground
+        rew_airTime *= np.linalg.norm(self.commands[:2]) > 0.1  # no reward for zero command
+        self.feet_air_time *= ~contact_filt
+        return rew_airTime
     
     def _reward_stumble(self):
-        """Penalty for stumbling (rapid foot contacts)."""
-        if not hasattr(self, 'last_contacts'):
+        """Penalize feet hitting vertical surfaces."""
+        # Simplified stumble detection - look for rapid height changes
+        if not hasattr(self, 'last_base_height'):
+            self.last_base_height = self.base_pos[2]
             return 0.0
         
-        # Initialize contact change tracking
-        if not hasattr(self, 'contact_changes'):
-            self.contact_changes = np.zeros(4)
+        height_change = abs(self.base_pos[2] - self.last_base_height)
+        self.last_base_height = self.base_pos[2]
         
-        # Detect rapid contact changes (stumbling)
-        current_contacts = self.last_contacts if hasattr(self, 'last_contacts') else np.ones(4, dtype=bool)
-        
-        stumble_penalty = 0.0
-        for i in range(4):
-            if hasattr(self, 'last_last_contacts'):
-                # Check for rapid on-off-on pattern (stumble indicator)
-                if (self.last_last_contacts[i] and 
-                    not self.last_contacts[i] and 
-                    current_contacts[i]):
-                    stumble_penalty += 1.0
-        
-        # Store contact history
-        if hasattr(self, 'last_contacts'):
-            self.last_last_contacts = self.last_contacts.copy()
-        
-        return stumble_penalty
-    
-    def _reward_feet_contact_forces(self):
-        """Reward for appropriate contact forces (placeholder)."""
-        # In real implementation, this would use force sensors
-        # For now, return small positive reward when on ground
-        if self.base_pos[2] > 0.2 and self.base_pos[2] < 0.4:  # Reasonable height
-            return 0.1
+        # If height changes too rapidly, consider it stumbling
+        if height_change > 0.05:  # 5cm change per timestep
+            return 1.0
         return 0.0
-    
+        
     def _reward_stand_still(self):
-        """Penalty for standing still when commands are zero."""
-        cmd_norm = np.linalg.norm(self.commands[:2])
-        if cmd_norm < 0.1:
-            return np.linalg.norm(self.base_lin_vel[:2])  # penalize movement when should stand still
+        """Penalize motion at zero commands."""
+        # Get default joint positions
+        default_pos = np.array([
+            0.1, 0.8, -1.5,   # FL leg
+            -0.1, 0.8, -1.5,  # FR leg
+            0.1, 1.0, -1.5,   # RL leg  
+            -0.1, 1.0, -1.5   # RR leg
+        ])
+        
+        joint_deviation = np.sum(np.abs(self.dof_pos - default_pos))
+        cmd_magnitude = np.linalg.norm(self.commands[:2])
+        
+        return joint_deviation * (cmd_magnitude < 0.1)
+
+    def _reward_feet_contact_forces(self):
+        """Penalize high contact forces."""
+        # Simplified - use contact detection as proxy for contact forces
+        max_contact_force = getattr(GO2RoughCfg.rewards, 'max_contact_force', 100.0)
+        
+        # Estimate contact forces from base acceleration and leg loading
+        # This is very simplified - in real implementation would use force sensors
+        base_accel = np.linalg.norm(self.base_lin_vel - getattr(self, 'last_base_vel', np.zeros(3))) / self.dt
+        estimated_force = base_accel * 15.0  # rough mass estimate
+        
+        self.last_base_vel = self.base_lin_vel.copy()
+        
+        if estimated_force > max_contact_force:
+            return estimated_force - max_contact_force
         return 0.0
     
-    def _reward_dof_acc(self):
-        """Penalize dof accelerations."""
-        if hasattr(self, 'last_dof_vel'):
-            dof_acc = (self.last_dof_vel - self.dof_vel) / self.dt
-            self.last_dof_vel = self.dof_vel.copy()
-            return np.sum(np.square(dof_acc))
-        else:
-            self.last_dof_vel = self.dof_vel.copy()
-            return 0.0
-    
+    def _reward_dof_pos_limits(self):
+        """Penalize dof positions too close to the limit."""
+        # GO2 joint limits from URDF
+        lower_limits = np.array([
+            -1.0472, -1.5708, -2.7227,  # FL leg
+            -1.0472, -1.5708, -2.7227,  # FR leg  
+            -1.0472, -0.5236, -2.7227,  # RL leg
+            -1.0472, -0.5236, -2.7227   # RR leg
+        ])
+        upper_limits = np.array([
+            1.0472, 3.4907, -0.83776,   # FL leg
+            1.0472, 3.4907, -0.83776,   # FR leg
+            1.0472, 4.5379, -0.83776,   # RL leg  
+            1.0472, 4.5379, -0.83776    # RR leg
+        ])
+        
+        # Apply soft limits
+        soft_limit = getattr(GO2RoughCfg.rewards, 'soft_dof_pos_limit', 0.9)
+        mid_range = (lower_limits + upper_limits) / 2
+        range_size = upper_limits - lower_limits
+        soft_lower = mid_range - 0.5 * range_size * soft_limit
+        soft_upper = mid_range + 0.5 * range_size * soft_limit
+        
+        out_of_limits = np.clip(soft_lower - self.dof_pos, 0, None)  # lower limit violations
+        out_of_limits += np.clip(self.dof_pos - soft_upper, 0, None)  # upper limit violations
+        return np.sum(out_of_limits)
+
     def _reward_dof_vel_limits(self):
-        """Penalize dof velocities close to limits."""
-        # GO2 approximate joint velocity limits (rad/s)
+        """Penalize dof velocities too close to the limit."""
+        # GO2 joint velocity limits (rad/s)
         vel_limits = np.array([
             21.0, 21.0, 33.0,  # FL leg  
             21.0, 21.0, 33.0,  # FR leg
@@ -903,13 +1163,14 @@ class Go2GymEnv(MujocoGymEnv):
             21.0, 21.0, 33.0   # RR leg
         ])
         
-        soft_limit = 0.9
-        vel_violations = np.clip(np.abs(self.dof_vel) - vel_limits * soft_limit, 0, None)
+        soft_limit = getattr(GO2RoughCfg.rewards, 'soft_dof_vel_limit', 1.0)
+        # clip to max error = 1 rad/s per joint to avoid huge penalties
+        vel_violations = np.clip(np.abs(self.dof_vel) - vel_limits * soft_limit, 0, 1.0)
         return np.sum(vel_violations)
-    
+
     def _reward_torque_limits(self):
-        """Penalize torques close to limits."""
-        # GO2 approximate torque limits (Nm)
+        """Penalize torques too close to the limit."""
+        # GO2 torque limits (Nm)
         torque_limits = np.array([
             23.7, 23.7, 35.5,  # FL leg
             23.7, 23.7, 35.5,  # FR leg  
@@ -917,47 +1178,9 @@ class Go2GymEnv(MujocoGymEnv):
             23.7, 23.7, 35.5   # RR leg
         ])
         
-        soft_limit = 0.8
-        # Use action magnitude as torque proxy
-        torque_violations = np.clip(np.abs(self._previous_actions) * 50.0 - torque_limits * soft_limit, 0, None)
+        soft_limit = getattr(GO2RoughCfg.rewards, 'soft_torque_limit', 1.0)
+        torque_violations = np.clip(np.abs(self.torques) - torque_limits * soft_limit, 0, None)
         return np.sum(torque_violations)
-    
-    def _reward_dof_pos(self):
-        """Penalize joint positions away from default."""
-        # GO2 default positions (standing pose)
-        default_pos = np.array([
-            0.0, 0.8, -1.5,   # FL leg
-            0.0, 0.8, -1.5,   # FR leg
-            0.0, 1.0, -1.5,   # RL leg  
-            0.0, 1.0, -1.5    # RR leg
-        ])
-        
-        return np.sum(np.square(self.dof_pos - default_pos))
-    
-    def _reward_termination(self):
-        """Terminal reward/penalty - 只在实际早期终止时给大惩罚"""
-        # 检查是否有早期终止标志
-        if hasattr(self, '_was_early_terminated') and self._was_early_terminated:
-            print("!!!!!!!!!!!!!!!!!!!!!!早期终止！！！给予大惩罚")
-            return 5.0  
-        else:
-            # 正常状态下，给予小的渐进式惩罚以引导行为
-            penalty = 0.0
-            base_pos = self.base_pos
-            roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
-            
-            # 轻微的渐进式惩罚 - 引导机器人保持良好状态
-            if base_pos[2] < 0.2:  # 高度稍低
-                penalty += (0.2 - base_pos[2]) * 0.5  # 越低惩罚越大
-            
-            if abs(roll) > 0.3 or abs(pitch) > 0.3:  # 轻微倾斜
-                penalty += (abs(roll) + abs(pitch) - 0.6) * 0.3
-            
-            # Debug info
-            if penalty > 0:
-                print(f"DEBUG termination: height={base_pos[2]:.3f}, roll={roll:.3f}, pitch={pitch:.3f}, penalty={penalty:.3f}")
-            
-            return penalty  # 返回负数作为惩罚
     
     def _get_euler_from_quat(self, quat):
         """Convert quaternion to Euler angles (roll, pitch, yaw)."""
@@ -1003,6 +1226,68 @@ class Go2GymEnv(MujocoGymEnv):
         result = vec + 2.0 * cross2
         
         return result.astype(np.float32)
+
+    def _sigmoids(self, x, value_at_1, sigmoid):
+        """Various sigmoid functions for tolerance reward."""
+        if sigmoid == 'gaussian':
+            return value_at_1 * np.exp(-0.5 * x**2)
+        elif sigmoid == 'linear':
+            return np.where(x <= 1.0, (1.0 - x) + value_at_1 * x, 0.0)
+        elif sigmoid == 'hyperbolic':
+            return value_at_1 * (1.0 / (1.0 + x**2))
+        elif sigmoid == 'long_tail':
+            return value_at_1 * (2.0 / (1.0 + x**2))
+        elif sigmoid == 'cosine':
+            return value_at_1 * (0.5 * (1.0 + np.cos(np.pi * np.minimum(x, 1.0))))
+        elif sigmoid == 'tanh_squared':
+            return value_at_1 * (1.0 - np.tanh(x)**2)
+        else:
+            # Default to gaussian
+            return value_at_1 * np.exp(-0.5 * x**2)
+
+    def _tolerance_reward(self, x, bounds=(0.0, 0.0), margin=0.0, sigmoid='gaussian', value_at_margin=0.1):
+        """
+        Returns 1 when `x` falls inside the bounds, between 0 and 1 otherwise.
+        
+        Args:
+            x: A scalar or numpy array.
+            bounds: A tuple of floats specifying inclusive `(lower, upper)` bounds for
+                the target interval. These can be infinite if the interval is unbounded
+                at one or both ends, or they can be equal to one another if the target
+                value is exact.
+            margin: Float. Parameter that controls how steeply the output decreases as
+                `x` moves out-of-bounds.
+                * If `margin == 0` then the output will be 0 for all values of `x`
+                  outside of `bounds`.
+                * If `margin > 0` then the output will decrease sigmoidally with
+                  increasing distance from the nearest bound.
+            sigmoid: String, choice of sigmoid type. Valid values are: 'gaussian',
+               'linear', 'hyperbolic', 'long_tail', 'cosine', 'tanh_squared'.
+            value_at_margin: A float between 0 and 1 specifying the output value when
+                the distance from `x` to the nearest bound is equal to `margin`. Ignored
+                if `margin == 0`.
+        
+        Returns:
+            A float or numpy array with values between 0.0 and 1.0.
+        
+        Raises:
+            ValueError: If `bounds[0] > bounds[1]`.
+            ValueError: If `margin` is negative.
+        """
+        lower, upper = bounds
+        if lower > upper:
+            raise ValueError('Lower bound must be <= upper bound.')
+        if margin < 0:
+            raise ValueError('`margin` must be non-negative.')
+
+        in_bounds = np.logical_and(lower <= x, x <= upper)
+        if margin == 0:
+            value = np.where(in_bounds, 1.0, 0.0)
+        else:
+            d = np.where(x < lower, lower - x, x - upper) / margin
+            value = np.where(in_bounds, 1.0, self._sigmoids(d, value_at_margin, sigmoid))
+
+        return float(value) if np.isscalar(x) else value
 
 
 def make_go2_env(render_mode="rgb_array", **kwargs):

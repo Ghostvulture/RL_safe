@@ -30,6 +30,7 @@ class SimpleGO2Config:
     class env:
         num_observations = 48
         enable_early_termination = True  # 启用早期终止以加快训练
+        use_sparse_reward = False  # 设置为True使用稀疏奖励，False使用复杂奖励
     
     class control:
         action_scale = 0.25  # Reduced from 0.25 to prevent large joint movements
@@ -46,9 +47,9 @@ class SimpleGO2Config:
         class scales:
             # 正向奖励 - 鼓励前进和存活
             alive = 2.0                    # 新增：存活奖励
-            tracking = 100.0                 # 新增：前进奖励
+            tracking = 1.0                 # 新增：前进奖励
             tracking_lin_vel = 2.0         # 增强：线速度跟踪
-            tracking_ang_vel = 0.5         # 保持：角速度跟踪
+            tracking_ang_vel = -2.5         # 保持：角速度跟踪
             
             # 姿态和稳定性
             orientation = -2.0             # 增强：防止翻倒
