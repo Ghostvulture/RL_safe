@@ -19,6 +19,7 @@ Actor负责与环境交互，收集经验数据。以下是Actor端WandB记录�
 #### 🏃 Episode级别指标 (每个episode结束时记录)
 | 变量名 | 描述 | 意义 |
 |--------|------|------|
+
 | `actor/episode_reward` | 单个episode的总奖励 | 衡量机器人在一个episode中的整体表现 |
 | `actor/episode_length` | episode的步数长度 | 机器人能够持续行走的时间 |
 | `actor/episode_count` | 累计完成的episode数量 | 训练进度指示器 |
@@ -33,8 +34,8 @@ Actor负责与环境交互，收集经验数据。以下是Actor端WandB记录�
 | `actor/max_episode_reward` | 历史最高episode奖励 | 最佳表现记录 |
 | `actor/min_episode_reward` | 历史最低episode奖励 | 最差表现记录 |
 | `actor/avg_episode_length_10` | 最近10个episode的平均长度 | 稳定性趋势 |
-| `actor/steps_per_second` | 环境交互速度 (步/秒) | 训练效率指标 |
-| `actor/replay_buffer_size` | 经验回放缓冲区大小 | 数据收集进度 |
+<!-- | `actor/steps_per_second` | 环境交互速度 (步/秒) | 训练效率指标 |
+| `actor/replay_buffer_size` | 经验回放缓冲区大小 | 数据收集进度 | -->
 
 #### 🎯 评估指标 (每`eval_period`步记录)
 通过`evaluate`函数记录的评估结果，包含：
@@ -51,8 +52,8 @@ Learner负责神经网络训练，优化策略和价值函数。以下是Learner
 |--------|------|------|
 | `sac/actor_loss` | Actor网络损失 | 策略网络优化程度 |
 | `sac/critic_loss` | Critic网络损失 | 价值函数拟合误差 |
-| `sac/temperature_loss` | 温度参数损失 | 熵正则化调节 |
-| `sac/temperature` | 当前温度参数值 | 探索与利用平衡 |
+<!-- | `sac/temperature_loss` | 温度参数损失 | 熵正则化调节 |
+| `sac/temperature` | 当前温度参数值 | 探索与利用平衡 | -->
 | `sac/entropy` | 策略熵值 | 动作分布的随机性 |
 
 #### ⚡ 训练进度指标

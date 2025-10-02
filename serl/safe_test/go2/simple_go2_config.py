@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
 """    class control:
-        action_scale = 0.25  # GO2 original action scale
+        action            # 限制约束
+            dof_pos_limits = -1.0         # 减轻：关节位置限制
+            collision = -1.0              # 增强：碰撞惩罚
+            termination = -2.0            # 启用：早期终止惩罚le = 0.25  # GO2 original action scale
         decimation = 4plified GO2 configuration for testing when go2_rl module is not available"""
 
 class SimpleGO2Config:
@@ -26,6 +29,7 @@ class SimpleGO2Config:
     
     class env:
         num_observations = 48
+        enable_early_termination = True  # 启用早期终止以加快训练
     
     class control:
         action_scale = 0.25  # Reduced from 0.25 to prevent large joint movements
@@ -42,7 +46,7 @@ class SimpleGO2Config:
         class scales:
             # 正向奖励 - 鼓励前进和存活
             alive = 2.0                    # 新增：存活奖励
-            tracking = 10.0                 # 新增：前进奖励
+            tracking = 100.0                 # 新增：前进奖励
             tracking_lin_vel = 2.0         # 增强：线速度跟踪
             tracking_ang_vel = 0.5         # 保持：角速度跟踪
             
@@ -51,7 +55,6 @@ class SimpleGO2Config:
             base_height = -0.5             # 新增：高度保持
             lin_vel_z = -1.0              
             ang_vel_xy = -0.1             # 增强：防止侧翻
-            torso_ori = -0.1              # 增强：防止躯干翻转
             # 动作平滑性
             action_rate = -0.01           # 保持：动作变化率
             dof_vel = -0.0              # 增强：关节速度惩罚
@@ -61,7 +64,7 @@ class SimpleGO2Config:
             # 限制约束
             dof_pos_limits = -0.0         # 减轻：关节位置限制
             collision = -0.1              # 增强：碰撞惩罚
-            termination = -0.0           # 增强：终止惩罚
+            termination = -10.0           # 增强：终止惩罚
             
             # 暂时关闭的奖励
             stand_still = 0.0

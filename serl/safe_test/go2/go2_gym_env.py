@@ -101,7 +101,9 @@ class Go2GymEnv(MujocoGymEnv):
             "render_fps": int(np.round(1.0 / self.control_dt)),
         }
 
-        self.render_height = render_spec.height if render_spec.height is not None else 768
+        self.render_mode = render_mode
+        self.render_width = render_spec.width if render_spec.width is not None else 1024  # Increased resolution
+        self.render_height = render_spec.height if render_spec.height is not None else 768  # Increased resolution
 
         self.camera_id = (0, 1)
         self.image_obs = image_obs
@@ -290,6 +292,9 @@ class Go2GymEnv(MujocoGymEnv):
         # Reset time
         self._time = 0.0
         
+        # 初始化早期终止标志
+        self._was_early_terminated = False
+        
         # Forward dynamics to update the state
         mujoco.mj_forward(self._model, self._data)
         
@@ -342,7 +347,7 @@ class Go2GymEnv(MujocoGymEnv):
         
         # PD Controller: torques = Kp*(target - current) - Kd*velocity
         Kps = [30.0] *12 
-        Kds = [3.0] *12 
+        Kds = [2.0] *12 
         position_error = target_joint_pos - current_joint_pos
         torques = (position_error) * Kps + (np.zeros_like(Kds) - current_joint_vel) * Kds
         
@@ -375,11 +380,72 @@ class Go2GymEnv(MujocoGymEnv):
             self._resample_commands()
         obs = self._compute_observation()
         rew = self._compute_reward()
-        terminated = self.time_limit_exceeded()
+        
+        # 早期终止条件检查 - 加快训练速度
+        early_terminated = self._check_early_termination()
+        
+        # 如果早期终止，设置标志供奖励函数使用
+        self._was_early_terminated = early_terminated
+        
+        # 如果没有早期终止，检查时间限制
+        terminated = early_terminated or self.time_limit_exceeded()
 
         print(f"episode: {int(self._time / self.control_dt):4d} reward: {rew} ")
 
         return obs, rew, terminated, False, {}
+
+    def _check_early_termination(self):
+        """检查早期终止条件，加快训练速度"""
+        # 检查是否启用早期终止
+        if not getattr(GO2RoughCfg.env, 'enable_early_termination', True):
+            return False
+            
+        # 获取当前机器人状态
+        base_pos = self._data.qpos[:3]
+        base_quat = self._data.qpos[3:7]
+        
+        # 1. 高度检查 - 如果机器人掉得太低
+        if base_pos[2] < 0.08:  # 低于8cm
+            print("！！！！！！！！！！！！！！！！！早期终止: 高度过低")
+            return True
+        
+        # 2. RPY角度检查 - 如果机器人翻倒
+        roll, pitch, yaw = self._get_euler_from_quat(base_quat)
+        
+        # 角度限制 - 给orientation奖励留出发挥空间
+        if abs(roll) > 0.5 or abs(pitch) > 0.5:  # 约30度
+            print(f"！！！！！！！！！！！！！！！！！早期终止: 姿态过倾斜 (roll={roll:.2f}, pitch={pitch:.2f})")
+            return True
+        
+        # 3. 速度检查 - 如果机器人在剧烈旋转
+        base_ang_vel = self._data.qvel[3:6]
+        if np.linalg.norm(base_ang_vel) > 5.0:  # 角速度过大
+            print(f"！！！！！！！！！！！！！！！！！早期终止: 角速度过大 ({np.linalg.norm(base_ang_vel):.2f})")
+            return True
+        
+        # 4. 位置检查 - 如果机器人移动太远
+        if abs(base_pos[0]) > 10.0 or abs(base_pos[1]) > 10.0:
+            print(f"！！！！！！！！！！！！！！！！！早期终止: 位置超出范围 ({base_pos[0]:.2f}, {base_pos[1]:.2f})")
+            return True
+            
+        # 5. 关节角度检查 - 如果关节超出安全范围
+        current_joint_angles = self._data.qpos[7:19]
+        joint_limits_lower = np.array([-1.0472, -1.5708, -2.7227, -1.0472, -1.5708, -2.7227, 
+                                       -1.0472, -1.5708, -2.7227, -1.0472, -1.5708, -2.7227])
+        joint_limits_upper = np.array([1.0472, 3.4907, -0.83776, 1.0472, 3.4907, -0.83776, 
+                                       1.0472, 3.4907, -0.83776, 1.0472, 3.4907, -0.83776])
+        
+        # 检查是否有关节严重超出限制
+        violations = 0
+        for i in range(12):
+            if current_joint_angles[i] < joint_limits_lower[i] - 0.2 or current_joint_angles[i] > joint_limits_upper[i] + 0.2:
+                violations += 1
+        
+        if violations >= 3:  # 如果3个或更多关节超出限制
+            print(f"早期终止: {violations}个关节严重超出限制")
+            return True
+        
+        return False
 
     def set_commands(self, lin_vel_x=0.0, lin_vel_y=0.0, ang_vel_z=0.0):
         """
@@ -399,18 +465,14 @@ class Go2GymEnv(MujocoGymEnv):
             print("DEBUG: No viewer available, returning empty frames")
             return []
         
-        print(f"DEBUG: Rendering with camera IDs: {self.camera_id}")
         rendered_frames = []
         for cam_id in self.camera_id:
             try:
-                # print(f"DEBUG: Rendering camera {cam_id}")
                 frame = self._viewer.render(render_mode="rgb_array")#, camera_id=cam_id
-                # print(f"DEBUG: Frame shape: {frame.shape if hasattr(frame, 'shape') else 'N/A'}")
                 rendered_frames.append(frame)
             except Exception as e:
                 print(f"ERROR: Failed to render camera {cam_id}: {e}")
         
-        # print(f"DEBUG: Rendered {len(rendered_frames)} frames")
         return rendered_frames
 
     # Helper methods.
@@ -447,10 +509,13 @@ class Go2GymEnv(MujocoGymEnv):
         base_quat = self._data.qpos[3:7]
         base_lin_vel = self._data.qvel[:3]
         base_ang_vel = self._data.qvel[3:6]
+        roll_dbg, pitch_dbg, _ = self._get_euler_from_quat(base_quat)
+
         
         print(f"Base pos: [{base_pos[0]:6.3f}, {base_pos[1]:6.3f}, {base_pos[2]:6.3f}]")
         print(f"Base vel: [{base_lin_vel[0]:6.3f}, {base_lin_vel[1]:6.3f}, {base_lin_vel[2]:6.3f}]")
         print(f"Base ang_vel: [{base_ang_vel[0]:6.3f}, {base_ang_vel[1]:6.3f}, {base_ang_vel[2]:6.3f}]")
+        print(f"Base RPY: roll={roll_dbg:.3f}, pitch={pitch_dbg:.3f}")
 
     def _compute_observation(self) -> dict:
         """Compute GO2 robot observations based on legged_gym structure."""
@@ -477,8 +542,8 @@ class Go2GymEnv(MujocoGymEnv):
         base_quat = self._data.qpos[3:7].copy()  # [w, x, y, z] in MuJoCo
         # Convert to rotation matrix and project gravity
         gravity_world = np.array([0, 0, -1], dtype=np.float32)  # Gravity in world frame
-        # For simplicity, approximate projected gravity (this should be computed properly with quaternion)
-        projected_gravity = gravity_world  # Placeholder - should be rotated to body frame
+        # Properly rotate gravity vector to body frame using quaternion
+        projected_gravity = self._quat_rotate_inverse(base_quat, gravity_world)
         obs["state"]["go2/gravity_orientation"] = projected_gravity
         
         # Movement commands (3)
@@ -522,8 +587,8 @@ class Go2GymEnv(MujocoGymEnv):
         self.reward_functions = []
         self.reward_names = []
         for name, scale in self.reward_scales.items():
-            if name == "termination":
-                continue
+            # if name == "termination":
+            #     continue
             self.reward_names.append(name)
             func_name = '_reward_' + name
             if hasattr(self, func_name):
@@ -574,9 +639,8 @@ class Go2GymEnv(MujocoGymEnv):
         
         # Projected gravity (properly computed with quaternion rotation)
         gravity_world = np.array([0, 0, -1], dtype=np.float32)
-        # Convert quaternion to rotation matrix and rotate gravity vector
-        # For simplicity using approximation, should implement proper quaternion rotation
-        self.projected_gravity = gravity_world  # TODO: Implement proper rotation
+        # Properly rotate gravity vector to body frame using quaternion
+        self.projected_gravity = self._quat_rotate_inverse(self.base_quat, gravity_world)
         
         # Commands
         self.commands = self._commands.copy()
@@ -618,15 +682,16 @@ class Go2GymEnv(MujocoGymEnv):
         # 鼓励身体水平时前进
         forward_aligned = lin_vel * np.cos(pitch)
 
-        # 使用 tolerance：目标速度范围 [0.5, 1.0] 时给最高奖励
-        target_low = 0.5
-        tol_reward = self._tolerance(forward_aligned, target_low, target_low*2)
+        # # 使用 tolerance：目标速度范围 [0.5, 1.0] 时给最高奖励
+        # target_low = 0.5
+        # tol_reward = self._tolerance(forward_aligned, target_low, target_low*2)
 
-        # 偏航（yaw 角速度）惩罚
-        yaw_rate = float(self.base_ang_vel[2])
-        yaw_penalty = 0.1 * abs(yaw_rate)
+        # # 偏航（yaw 角速度）惩罚
+        # yaw_rate = float(self.base_ang_vel[2])
+        # yaw_penalty = 0.1 * abs(yaw_rate)
 
-        reward = tol_reward - yaw_penalty
+        # reward = tol_reward - yaw_penalty
+        reward += forward_aligned
         reward = max(reward, 0.0)  # 不让 reward 变为负数（可选策略）
         reward *= 10.0
 
@@ -636,13 +701,13 @@ class Go2GymEnv(MujocoGymEnv):
         """Tracking of linear velocity commands (xy axes)."""
         lin_vel_error = np.sum(np.square(self.commands[:2] - self.base_lin_vel[:2]))
         tracking_sigma = getattr(GO2RoughCfg.rewards, 'tracking_sigma', 0.25)
-        return np.exp(-lin_vel_error / tracking_sigma)
+        return np.exp(-lin_vel_error / tracking_sigma)*5
     
     def _reward_tracking_ang_vel(self):
         """Tracking of angular velocity commands (yaw).""" 
         ang_vel_error = np.square(self.commands[2] - self.base_ang_vel[2])
         tracking_sigma = getattr(GO2RoughCfg.rewards, 'tracking_sigma', 0.25)
-        return np.exp(-ang_vel_error / tracking_sigma)
+        return np.exp(-ang_vel_error / tracking_sigma)*5
     
     def _reward_lin_vel_z(self):
         """Penalize z axis base linear velocity."""
@@ -654,7 +719,17 @@ class Go2GymEnv(MujocoGymEnv):
     
     def _reward_orientation(self):
         """Penalize non flat base orientation."""
-        return np.sum(np.square(self.projected_gravity[:2]))
+        # Use the first two components (x, y) of projected gravity
+        # When robot is upright, projected_gravity should be [0, 0, -1]
+        # When tilted, x and y components will be non-zero
+        orientation_penalty = np.sum(np.square(self.projected_gravity[:2]))
+        
+        # Debug: Print orientation info occasionally
+        if hasattr(self, '_time') and int(self._time / self.control_dt) % 50 == 0:
+            roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+            print(f"DEBUG orientation: projected_gravity={self.projected_gravity}, penalty={orientation_penalty:.6f}, roll={roll:.3f}, pitch={pitch:.3f}")
+        
+        return orientation_penalty
     
     def _reward_base_height(self):
         """Penalize base height away from target."""
@@ -860,19 +935,29 @@ class Go2GymEnv(MujocoGymEnv):
         return np.sum(np.square(self.dof_pos - default_pos))
     
     def _reward_termination(self):
-        """Terminal reward/penalty."""
-        termination_penalty = 0.0
-        
-        # Check if robot fell down
-        if self.base_pos[2] < 0.15:
-            termination_penalty += 1.0
-        
-        # Check if robot is too tilted
-        roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
-        if abs(roll) > 1.0 or abs(pitch) > 1.0:
-            termination_penalty += 1.0
-        
-        return termination_penalty
+        """Terminal reward/penalty - 只在实际早期终止时给大惩罚"""
+        # 检查是否有早期终止标志
+        if hasattr(self, '_was_early_terminated') and self._was_early_terminated:
+            print("!!!!!!!!!!!!!!!!!!!!!!早期终止！！！给予大惩罚")
+            return 5.0  
+        else:
+            # 正常状态下，给予小的渐进式惩罚以引导行为
+            penalty = 0.0
+            base_pos = self.base_pos
+            roll, pitch, _ = self._get_euler_from_quat(self.base_quat)
+            
+            # 轻微的渐进式惩罚 - 引导机器人保持良好状态
+            if base_pos[2] < 0.2:  # 高度稍低
+                penalty += (0.2 - base_pos[2]) * 0.5  # 越低惩罚越大
+            
+            if abs(roll) > 0.3 or abs(pitch) > 0.3:  # 轻微倾斜
+                penalty += (abs(roll) + abs(pitch) - 0.6) * 0.3
+            
+            # Debug info
+            if penalty > 0:
+                print(f"DEBUG termination: height={base_pos[2]:.3f}, roll={roll:.3f}, pitch={pitch:.3f}, penalty={penalty:.3f}")
+            
+            return penalty  # 返回负数作为惩罚
     
     def _get_euler_from_quat(self, quat):
         """Convert quaternion to Euler angles (roll, pitch, yaw)."""
@@ -894,6 +979,30 @@ class Go2GymEnv(MujocoGymEnv):
         yaw = np.arctan2(siny_cosp, cosy_cosp)
         
         return roll, pitch, yaw
+
+    def _quat_rotate_inverse(self, quat, vec):
+        """Rotate vector by the inverse of a quaternion."""
+        # quat is [w, x, y, z] in MuJoCo format
+        # Convert to inverse quaternion (conjugate for unit quaternions)
+        w, x, y, z = quat
+        quat_inv = np.array([w, -x, -y, -z], dtype=np.float32)
+        
+        # Perform quaternion rotation: q^-1 * vec * q
+        # For efficiency, we can use the rotation formula directly
+        # v' = v + 2 * cross(q_xyz, cross(q_xyz, v) + q_w * v)
+        q_xyz = quat_inv[1:4]  # [x, y, z] part
+        q_w = quat_inv[0]      # w part
+        
+        # First cross product: cross(q_xyz, v) + q_w * v
+        cross1 = np.cross(q_xyz, vec) + q_w * vec
+        
+        # Second cross product: cross(q_xyz, cross1)
+        cross2 = np.cross(q_xyz, cross1)
+        
+        # Final result: v + 2 * cross2
+        result = vec + 2.0 * cross2
+        
+        return result.astype(np.float32)
 
 
 def make_go2_env(render_mode="rgb_array", **kwargs):

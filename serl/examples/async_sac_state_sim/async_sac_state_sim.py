@@ -178,7 +178,7 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
     
     # Set forward walking command for GO2 training
     if FLAGS.env == "GO2-v0":
-        env.set_commands(lin_vel_x=-1.0, lin_vel_y=0.0, ang_vel_z=0.0)  # 1 m/s forward
+        env.set_commands(lin_vel_x=1.0, lin_vel_y=0.0, ang_vel_z=0.0)  # 1 m/s forward
         print("GO2 commands set: Forward walking at 1.0 m/s")
 
     # training loop
@@ -255,7 +255,7 @@ def actor(agent: SACAgent, data_store, env, sampling_rng):
                 
                 # Reset forward walking command after each episode
                 if FLAGS.env == "GO2-v0":
-                    env.set_commands(lin_vel_x=-1.0, lin_vel_y=0.0, ang_vel_z=0.0)  # 1 m/s forward
+                    env.set_commands(lin_vel_x=1.0, lin_vel_y=0.0, ang_vel_z=0.0)  # 1 m/s forward
 
         if FLAGS.render:
             env.render()
